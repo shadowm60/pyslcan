@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -20,6 +22,8 @@ from bluetooth_windows import BluetoothDevice, BluetoothUnavailableError, discov
 from ecu_simulator import (
     DEFAULT_SWEEPS,
     EcuSimulator,
+    MULTI_VALUE_PID_LIMITS,
+    NUMERIC_PID_LIMITS,
     PID_BITMAP_PAGES,
     PID_CATALOG,
     PID_DEFINITIONS,
@@ -29,7 +33,13 @@ from ecu_simulator import (
     save_config,
 )
 from serial_worker import SerialWorker
-from slcan_protocol import BITRATES, CanFrame, encode_frame, parse_frame
+from slcan_protocol import (
+    BITRATES,
+    CanFrame,
+    encode_frame,
+    estimate_can_frame_bits,
+    parse_frame,
+)
 
 
 BAUD_RATES = ("9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600")
@@ -48,6 +58,11 @@ class SlcanApp:
         self.can_open = False
         self._closing = False
         self._records = []
+        self._bus_load_samples = deque()
+        self._bus_load_bitrate = None
+        self.bus_load_var = tk.StringVar(
+            value="CAN closed. Estimate includes observed RX and TX frames only."
+        )
         self.debug_enabled_var = tk.BooleanVar(value=False)
         self.debug_messages = []
         self.debug_window = None
@@ -211,6 +226,12 @@ class SlcanApp:
             )
             button.pack(side="left", padx=4, pady=5)
             self._command_buttons.append(button)
+
+        bus_load = ttk.LabelFrame(self.main_tab, text="Estimated CAN bus load")
+        bus_load.pack(fill="x", padx=8, pady=4)
+        ttk.Label(bus_load, textvariable=self.bus_load_var, anchor="w").pack(
+            fill="x", padx=6, pady=4
+        )
 
         transmit = ttk.LabelFrame(self.main_tab, text="Transmit CAN frame")
         transmit.pack(fill="x", padx=8, pady=4)
@@ -531,7 +552,11 @@ class SlcanApp:
         if is_new:
             name = metadata.get("name", "")
             unit = metadata.get("unit", "")
-            algorithm = "raw"
+            algorithm = (
+                "sweep"
+                if pid in NUMERIC_PID_LIMITS or pid in MULTI_VALUE_PID_LIMITS
+                else "raw"
+            )
         elif built_in:
             name, unit, _kind = built_in
             algorithm = old_entry.get(
@@ -539,7 +564,7 @@ class SlcanApp:
             )
         else:
             name, unit = old_entry["name"], old_entry["unit"]
-            algorithm = "raw"
+            algorithm = old_entry.get("algorithm", "raw")
 
         window = tk.Toplevel(self.root)
         window.title("Add Mode 01 PID" if is_new else f"Edit PID 0x{pid:02X}")
@@ -561,21 +586,60 @@ class SlcanApp:
             range_text = metadata.get("range_description", "Not specified")
         range_var = tk.StringVar(value=range_text)
         algorithm_var = tk.StringVar(value=algorithm)
-        supported_var = tk.BooleanVar(value=old_entry.get("supported", True))
+        supported_var = tk.BooleanVar(
+            value=old_entry.get(
+                "supported", metadata.get("default_supported", True)
+            )
+        )
         raw_var = tk.StringVar(
             value=old_entry.get(
                 "raw_bytes", metadata.get("default_raw_bytes", "00")
             )
         )
-        sweep = old_entry.get("sweep", DEFAULT_SWEEPS.get(pid, {}))
+        def default_sweep_for(selected_pid, selected_metadata):
+            if selected_pid in MULTI_VALUE_PID_LIMITS:
+                default = {"interval_s": 1}
+                for field, (minimum, maximum) in MULTI_VALUE_PID_LIMITS[
+                    selected_pid
+                ].items():
+                    default.update(
+                        {
+                            f"{field}_minimum": minimum,
+                            f"{field}_maximum": maximum,
+                            f"{field}_step": (maximum - minimum) / 10,
+                        }
+                    )
+                return default
+            return DEFAULT_SWEEPS.get(
+                selected_pid,
+                {
+                    "minimum": selected_metadata.get(
+                        "minimum", NUMERIC_PID_LIMITS.get(selected_pid, (0, 100))[0]
+                    ),
+                    "maximum": selected_metadata.get(
+                        "maximum", NUMERIC_PID_LIMITS.get(selected_pid, (0, 100))[1]
+                    ),
+                    "step": 1,
+                    "interval_s": 1,
+                },
+            )
+
+        default_sweep = default_sweep_for(pid, metadata)
+        sweep = old_entry.get("sweep", default_sweep)
         sweep_vars = {
             field: tk.StringVar(value=str(sweep.get(field, default)))
-            for field, default in (
-                ("minimum", 0),
-                ("maximum", 100),
-                ("step", 1),
-                ("interval_s", 1),
-            )
+            for field, default in {
+                "minimum": 0,
+                "maximum": 100,
+                "step": 1,
+                "interval_s": 1,
+                "lambda_minimum": 0,
+                "lambda_maximum": 2,
+                "lambda_step": 0.2,
+                "voltage_minimum": 0,
+                "voltage_maximum": 8,
+                "voltage_step": 0.8,
+            }.items()
         }
 
         row = 0
@@ -612,6 +676,29 @@ class SlcanApp:
                 unit_var.set(selected_metadata.get("unit", ""))
                 description_var.set(selected_metadata.get("description", ""))
                 measurement_var.set(selected_metadata.get("measurement", ""))
+                supported_var.set(
+                    selected_metadata.get("default_supported", True)
+                )
+                can_sweep = (
+                    selected_pid in NUMERIC_PID_LIMITS
+                    or selected_pid in MULTI_VALUE_PID_LIMITS
+                )
+                selected_algorithm = "sweep" if can_sweep else "raw"
+                algorithm_var.set(selected_algorithm)
+                algorithm_combo.configure(
+                    values=(
+                        ("sweep", "random", "raw")
+                        if can_sweep
+                        else ("raw",)
+                    )
+                )
+                selected_sweep = default_sweep_for(
+                    selected_pid, selected_metadata
+                )
+                for field, variable in sweep_vars.items():
+                    if field in selected_sweep:
+                        variable.set(str(selected_sweep[field]))
+                refresh_sweep_fields()
                 if "minimum" in selected_metadata and "maximum" in selected_metadata:
                     range_var.set(
                         f"{selected_metadata['minimum']:g} to "
@@ -667,8 +754,8 @@ class SlcanApp:
         )
         row += 1
 
-        if built_in and pid in DEFAULT_SWEEPS:
-            algorithms = ("sweep", "raw")
+        if pid in NUMERIC_PID_LIMITS or pid in MULTI_VALUE_PID_LIMITS:
+            algorithms = ("sweep", "random", "raw")
         elif built_in:
             algorithms = ("standard", "raw")
         else:
@@ -693,22 +780,55 @@ class SlcanApp:
         raw_entry.grid(row=row, column=1, sticky="ew", pady=3)
         row += 1
 
-        sweep_entries = {}
-        for field, variable in sweep_vars.items():
-            ttk.Label(fields, text=field.replace("_", " ").title()).grid(
-                row=row, column=0, sticky="w", pady=3
-            )
-            entry = ttk.Entry(fields, textvariable=variable, width=14)
-            entry.grid(row=row, column=1, sticky="w", pady=3)
-            sweep_entries[field] = entry
-            row += 1
+        sweep_fields_frame = ttk.Frame(fields)
+        sweep_fields_frame.grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=(2, 0)
+        )
+        row += 1
+
+        def refresh_sweep_fields() -> None:
+            for child in sweep_fields_frame.winfo_children():
+                child.destroy()
+            selected_pid = int(pid_var.get(), 16)
+            algorithm = algorithm_var.get()
+            if selected_pid in MULTI_VALUE_PID_LIMITS:
+                available_fields = [
+                    ("lambda_minimum", "Equivalence ratio minimum"),
+                    ("lambda_maximum", "Equivalence ratio maximum"),
+                    ("voltage_minimum", "Voltage minimum (V)"),
+                    ("voltage_maximum", "Voltage maximum (V)"),
+                ]
+                if algorithm == "sweep":
+                    available_fields.extend(
+                        (
+                            ("lambda_step", "Equivalence ratio step"),
+                            ("voltage_step", "Voltage step (V)"),
+                            ("interval_s", "Update interval (s)"),
+                        )
+                    )
+            elif algorithm in ("sweep", "random"):
+                available_fields = [
+                    ("minimum", "Minimum"),
+                    ("maximum", "Maximum"),
+                ]
+                if algorithm == "sweep":
+                    available_fields.extend(
+                        (("step", "Step"), ("interval_s", "Update interval (s)"))
+                    )
+            else:
+                available_fields = []
+            for field_row, (field, label) in enumerate(available_fields):
+                ttk.Label(sweep_fields_frame, text=label).grid(
+                    row=field_row, column=0, sticky="w", pady=3
+                )
+                ttk.Entry(
+                    sweep_fields_frame, textvariable=sweep_vars[field], width=14
+                ).grid(row=field_row, column=1, sticky="w", pady=3)
 
         def update_algorithm_fields(*_args) -> None:
             raw_state = "normal" if algorithm_var.get() == "raw" else "disabled"
             raw_entry.configure(state=raw_state)
-            sweep_state = "normal" if algorithm_var.get() == "sweep" else "disabled"
-            for entry in sweep_entries.values():
-                entry.configure(state=sweep_state)
+            refresh_sweep_fields()
 
         algorithm_var.trace_add("write", update_algorithm_fields)
         update_algorithm_fields()
@@ -773,15 +893,42 @@ class SlcanApp:
                 entry["raw_bytes"] = raw_var.get()
             else:
                 entry.pop("raw_bytes", None)
-            if algorithm_var.get() == "sweep":
+            if algorithm_var.get() in ("sweep", "random"):
                 try:
+                    if pid_value in MULTI_VALUE_PID_LIMITS:
+                        fields_to_save = (
+                            (
+                                "lambda_minimum",
+                                "lambda_maximum",
+                                "lambda_step",
+                                "voltage_minimum",
+                                "voltage_maximum",
+                                "voltage_step",
+                                "interval_s",
+                            )
+                            if algorithm_var.get() == "sweep"
+                            else (
+                                "lambda_minimum",
+                                "lambda_maximum",
+                                "voltage_minimum",
+                                "voltage_maximum",
+                            )
+                        )
+                    else:
+                        fields_to_save = (
+                            ("minimum", "maximum", "step", "interval_s")
+                            if algorithm_var.get() == "sweep"
+                            else ("minimum", "maximum")
+                        )
                     entry["sweep"] = {
-                        field: float(variable.get())
-                        for field, variable in sweep_vars.items()
+                        field: float(sweep_vars[field].get())
+                        for field in fields_to_save
                     }
                 except ValueError:
                     messagebox.showerror(
-                        "Invalid sweep", "Sweep boundaries and timing must be numeric.", parent=window
+                        "Invalid value range",
+                        "PID value boundaries and sweep timing must be numeric.",
+                        parent=window,
                     )
                     return
             if self._commit_simulator_config(config, "Invalid PID configuration"):
@@ -995,7 +1142,7 @@ class SlcanApp:
         except SimulatorConfigError as exc:
             messagebox.showerror("Invalid ECU config", str(exc))
             return
-        self.simulator.reset_clock()
+        self.simulator.start_session()
         self.simulator_running = True
         self.simulator_start_button.configure(text="Stop simulator")
         self.simulator_status_var.set(
@@ -1295,8 +1442,39 @@ class SlcanApp:
                 self.scan_bluetooth_button.configure(state="normal")
                 self.status_var.set(f"Bluetooth scan failed: {event['message']}")
                 messagebox.showerror("Bluetooth scan failed", event["message"])
+        self._update_bus_load()
         if not self._closing:
             self.root.after(50, self._poll_events)
+
+    def _start_bus_load_measurement(self) -> None:
+        code = self.bitrate_var.get().split(" - ", 1)[0]
+        self._bus_load_bitrate = BITRATES.get(code)
+        self._bus_load_samples.clear()
+        self._update_bus_load()
+
+    def _stop_bus_load_measurement(self) -> None:
+        self._bus_load_bitrate = None
+        self._bus_load_samples.clear()
+        self._update_bus_load()
+
+    def _update_bus_load(self) -> None:
+        if self._bus_load_bitrate is None:
+            message = "CAN closed. Estimate includes observed RX and TX frames only."
+        else:
+            now = time.monotonic()
+            cutoff = now - 10.0
+            while self._bus_load_samples and self._bus_load_samples[0][0] < cutoff:
+                self._bus_load_samples.popleft()
+            total_bits = sum(bits for _timestamp, bits in self._bus_load_samples)
+            utilization = total_bits / (self._bus_load_bitrate * 10.0) * 100
+            message = (
+                f"{utilization:.2f}% over the last 10 s "
+                f"({total_bits} estimated bits at "
+                f"{self._bus_load_bitrate // 1000} kbit/s). "
+                "Observed RX/TX only; actual load may be higher."
+            )
+        if self.bus_load_var.get() != message:
+            self.bus_load_var.set(message)
 
     def _handle_event(self, event: Dict[str, Any]) -> None:
         event_type = event["type"]
@@ -1311,6 +1489,7 @@ class SlcanApp:
         elif event_type == "disconnected":
             self.connected = False
             self.can_open = False
+            self._stop_bus_load_measurement()
             self._stop_simulator()
             self._set_simulator_availability()
             self.worker = None
@@ -1364,6 +1543,8 @@ class SlcanApp:
         service = request.data[1]
         if service == 0x03:
             message = "OBD Mode 03 DTC request received; replying..."
+        elif service == 0x04:
+            message = "OBD Mode 04 clear-DTC request received; replying..."
         else:
             message = (
                 f"OBD Mode 01 PID 0x{request.data[2]:02X} request received; replying..."
@@ -1396,6 +1577,7 @@ class SlcanApp:
             self._send_command(mode_command, "open_can")
         elif tag == "open_can":
             self.can_open = True
+            self._start_bus_load_measurement()
             self.open_button.configure(state="disabled")
             self.close_can_button.configure(state="normal")
             self.send_button.configure(
@@ -1405,6 +1587,7 @@ class SlcanApp:
             self._set_simulator_availability()
         elif tag == "close_can":
             self.can_open = False
+            self._stop_bus_load_measurement()
             self.open_button.configure(state="normal")
             self.close_can_button.configure(state="disabled")
             self.send_button.configure(state="disabled")
@@ -1455,6 +1638,11 @@ class SlcanApp:
         self.frame_table.insert("", "end", values=values)
         self.frame_table.yview_moveto(1)
         self._records.append(values)
+        if self.can_open and self._bus_load_bitrate is not None:
+            self._bus_load_samples.append(
+                (time.monotonic(), estimate_can_frame_bits(frame))
+            )
+            self._update_bus_load()
 
     def export_csv(self) -> None:
         if not self._records:

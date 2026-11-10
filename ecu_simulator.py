@@ -2,6 +2,7 @@
 
 import json
 import math
+import random
 import re
 import time
 from pathlib import Path
@@ -169,6 +170,176 @@ PID_CATALOG = {
     },
 }
 
+STANDARD_PID_CATALOG = {
+    0x08: ("Short-term fuel trim, bank 2", 1),
+    0x09: ("Long-term fuel trim, bank 2", 1),
+    0x0A: ("Fuel pressure", 1),
+    0x0B: ("Intake manifold absolute pressure", 1),
+    0x0E: ("Timing advance", 1),
+    0x10: ("Mass air flow rate", 2),
+    0x12: ("Commanded secondary air status", 1),
+    0x13: ("Oxygen sensors present", 1),
+    0x14: ("Oxygen sensor 1 voltage and short-term trim", 2),
+    0x15: ("Oxygen sensor 2 voltage and short-term trim", 2),
+    0x16: ("Oxygen sensor 3 voltage and short-term trim", 2),
+    0x17: ("Oxygen sensor 4 voltage and short-term trim", 2),
+    0x18: ("Oxygen sensor 5 voltage and short-term trim", 2),
+    0x19: ("Oxygen sensor 6 voltage and short-term trim", 2),
+    0x1A: ("Oxygen sensor 7 voltage and short-term trim", 2),
+    0x1B: ("Oxygen sensor 8 voltage and short-term trim", 2),
+    0x1C: ("OBD standards supported", 1),
+    0x1D: ("Oxygen sensors present across four banks", 1),
+    0x1E: ("Auxiliary input status", 1),
+    0x21: ("Distance with malfunction indicator lamp on", 2),
+    0x22: ("Fuel rail pressure relative to manifold vacuum", 2),
+    0x23: ("Fuel rail gauge pressure", 2),
+    0x24: ("Wide-range oxygen sensor 1 equivalence ratio and voltage", 4),
+    0x25: ("Wide-range oxygen sensor 2 equivalence ratio and voltage", 4),
+    0x26: ("Wide-range oxygen sensor 3 equivalence ratio and voltage", 4),
+    0x27: ("Wide-range oxygen sensor 4 equivalence ratio and voltage", 4),
+    0x28: ("Wide-range oxygen sensor 5 equivalence ratio and voltage", 4),
+    0x29: ("Wide-range oxygen sensor 6 equivalence ratio and voltage", 4),
+    0x2A: ("Wide-range oxygen sensor 7 equivalence ratio and voltage", 4),
+    0x2B: ("Wide-range oxygen sensor 8 equivalence ratio and voltage", 4),
+    0x2C: ("Commanded exhaust gas recirculation", 1),
+    0x2D: ("Exhaust gas recirculation error", 1),
+    0x2E: ("Commanded evaporative purge", 1),
+    0x30: ("Warm-ups since DTCs cleared", 1),
+    0x32: ("Evaporative system vapor pressure", 2),
+    0x34: ("Wide-range oxygen sensor 1 equivalence ratio and current", 4),
+    0x35: ("Wide-range oxygen sensor 2 equivalence ratio and current", 4),
+    0x36: ("Wide-range oxygen sensor 3 equivalence ratio and current", 4),
+    0x37: ("Wide-range oxygen sensor 4 equivalence ratio and current", 4),
+    0x38: ("Wide-range oxygen sensor 5 equivalence ratio and current", 4),
+    0x39: ("Wide-range oxygen sensor 6 equivalence ratio and current", 4),
+    0x3A: ("Wide-range oxygen sensor 7 equivalence ratio and current", 4),
+    0x3B: ("Wide-range oxygen sensor 8 equivalence ratio and current", 4),
+    0x3C: ("Catalyst temperature, bank 1 sensor 1", 2),
+    0x3D: ("Catalyst temperature, bank 2 sensor 1", 2),
+    0x3E: ("Catalyst temperature, bank 1 sensor 2", 2),
+    0x3F: ("Catalyst temperature, bank 2 sensor 2", 2),
+    0x41: ("Monitor status this drive cycle", 4),
+    0x43: ("Absolute load value", 2),
+    0x44: ("Commanded air-fuel equivalence ratio", 2),
+    0x45: ("Relative throttle position", 1),
+    0x47: ("Absolute throttle position B", 1),
+    0x48: ("Absolute throttle position C", 1),
+    0x49: ("Accelerator pedal position D", 1),
+    0x4A: ("Accelerator pedal position E", 1),
+    0x4B: ("Accelerator pedal position F", 1),
+    0x4C: ("Commanded throttle actuator", 1),
+    0x4D: ("Time run with malfunction indicator lamp on", 2),
+    0x4E: ("Time since DTCs cleared", 2),
+    0x4F: ("Maximum sensor values", 4),
+    0x50: ("Maximum mass air flow sensor value", 4),
+    0x51: ("Fuel type", 1),
+    0x52: ("Ethanol fuel percentage", 1),
+    0x53: ("Absolute evaporative system vapor pressure", 2),
+    0x54: ("Evaporative system vapor pressure", 2),
+    0x55: ("Short-term secondary oxygen sensor trim, banks 1 and 3", 2),
+    0x56: ("Long-term secondary oxygen sensor trim, banks 1 and 3", 2),
+    0x57: ("Short-term secondary oxygen sensor trim, banks 2 and 4", 2),
+    0x58: ("Long-term secondary oxygen sensor trim, banks 2 and 4", 2),
+    0x59: ("Fuel rail absolute pressure", 2),
+    0x5A: ("Relative accelerator pedal position", 1),
+    0x5B: ("Hybrid battery pack remaining life", 1),
+    0x5D: ("Fuel injection timing", 2),
+    0x5E: ("Engine fuel rate", 2),
+    0x5F: ("Vehicle emission requirements", 1),
+    0x61: ("Driver-demanded engine torque", 1),
+    0x62: ("Actual engine torque", 1),
+    0x63: ("Engine reference torque", 2),
+    0x64: ("Engine percent torque data", 5),
+    0x65: ("Auxiliary input and output status", 2),
+    0x66: ("Mass air flow sensors A and B", 5),
+    0x67: ("Engine coolant temperature sensors", 3),
+    0x68: ("Intake air temperature sensors", 3),
+    0x69: ("Exhaust gas recirculation data", 7),
+    0x6A: ("Diesel intake air flow control data", 5),
+    0x6B: ("Exhaust gas recirculation temperature", 5),
+    0x6C: ("Throttle actuator control data", 5),
+    0x6D: ("Fuel pressure control system", 11),
+    0x6E: ("Injection pressure control system", 9),
+    0x6F: ("Turbocharger compressor inlet pressure", 3),
+    0x70: ("Boost pressure control", 10),
+    0x71: ("Variable-geometry turbocharger control", 6),
+    0x72: ("Wastegate control", 5),
+    0x73: ("Exhaust pressure", 5),
+    0x74: ("Turbocharger speed", 5),
+    0x75: ("Turbocharger temperature, sensor 1", 7),
+    0x76: ("Turbocharger temperature, sensor 2", 7),
+    0x77: ("Charge air cooler temperature", 5),
+    0x78: ("Exhaust gas temperature, bank 1", 9),
+    0x79: ("Exhaust gas temperature, bank 2", 9),
+    0x7A: ("Diesel particulate filter differential pressure", 7),
+    0x7B: ("Diesel particulate filter data", 7),
+    0x7C: ("Diesel particulate filter temperature", 9),
+    0x7D: ("NOx NTE control area status", 1),
+    0x7E: ("Particulate matter NTE control area status", 1),
+    0x7F: ("Engine run time data", 13),
+    0x81: ("Auxiliary emissions control device run time", 41),
+    0x82: ("Auxiliary emissions control device run time", 41),
+    0x83: ("NOx sensor data", 9),
+    0x84: ("Manifold surface temperature", 1),
+    0x85: ("NOx reagent system data", 10),
+    0x86: ("Particulate matter sensor data", 5),
+    0x87: ("Intake manifold absolute pressure sensors", 5),
+    0x88: ("SCR inducement system status", 13),
+    0x89: ("Auxiliary emissions control device run time, devices 11-15", 41),
+    0x8A: ("Auxiliary emissions control device run time, devices 16-20", 41),
+    0x8B: ("Diesel aftertreatment data", 7),
+    0x8C: ("Wide-range oxygen sensor data", 17),
+    0x8E: ("Engine friction torque", 1),
+    0x8F: ("Particulate matter sensor banks 1 and 2", 7),
+    0x90: ("WWH-OBD vehicle system information", 3),
+    0x91: ("WWH-OBD vehicle system information", 5),
+    0x92: ("Fuel system control", 2),
+    0x93: ("WWH-OBD vehicle counters supported", 3),
+    0x94: ("NOx warning and inducement system", 12),
+    0x98: ("Exhaust gas temperature sensors, bank 1", 9),
+    0x99: ("Exhaust gas temperature sensors, bank 2", 9),
+    0x9A: ("Hybrid and electric vehicle battery data", 6),
+    0x9B: ("Diesel exhaust fluid sensor data", 4),
+    0x9C: ("Oxygen sensor data", 17),
+    0x9D: ("Engine fuel rate", 4),
+    0x9E: ("Engine exhaust flow rate", 2),
+    0x9F: ("Fuel system percentage use", 9),
+    0xA1: ("Corrected NOx sensor data", 9),
+    0xA2: ("Cylinder fuel rate", 2),
+    0xA3: ("Evaporative system vapor pressure", 9),
+    0xA4: ("Transmission actual gear", 4),
+    0xA5: ("Commanded diesel exhaust fluid dosing", 4),
+    0xA6: ("Odometer", 4),
+    0xA7: ("NOx concentration sensors 3 and 4", 4),
+    0xA8: ("Corrected NOx concentration sensors 3 and 4", 4),
+    0xA9: ("ABS disable switch state", 4),
+    0xC3: ("Fuel level inputs A and B", 2),
+    0xC4: ("Exhaust particulate control diagnostics", 8),
+    0xC5: ("Fuel pressures A and B", 4),
+    0xC7: ("Distance since reflash or module replacement", 2),
+    0xC8: ("NOx and particulate control warning lamp status", 1),
+}
+
+for _pid, (_pid_name, _response_length) in STANDARD_PID_CATALOG.items():
+    if _pid in PID_CATALOG:
+        continue
+    _raw_length = min(_response_length, 5)
+    _multiframe = _response_length > 5
+    PID_CATALOG[_pid] = {
+        "name": _pid_name,
+        "description": f"Standard OBD-II Mode 01 data for {_pid_name.lower()}.",
+        "measurement": _pid_name,
+        "unit": "",
+        "range_description": (
+            f"{_response_length} response bytes; multi-frame responses are not "
+            "supported by this simulator."
+            if _multiframe
+            else f"{_response_length} response byte(s); configure the raw value."
+        ),
+        "default_raw_bytes": " ".join(["00"] * _raw_length),
+        "default_supported": not _multiframe,
+    }
+
 DEFAULT_REQUEST_IDS = (0x7DF, 0x7E0)
 DEFAULT_RESPONSE_ID = 0x7E8
 PID_BITMAP_PAGES = tuple(range(0, 0x100, 0x20))
@@ -190,6 +361,133 @@ DEFAULT_SWEEPS = {
     0x46: {"minimum": 10, "maximum": 30, "step": 1, "interval_s": 5.0},
     0x5C: {"minimum": 75, "maximum": 115, "step": 2, "interval_s": 2.0},
 }
+
+NUMERIC_PID_LIMITS = {
+    0x04: (0, 100),
+    0x05: (-40, 215),
+    0x06: (-100, 99.2),
+    0x07: (-100, 99.2),
+    0x08: (-100, 99.2),
+    0x09: (-100, 99.2),
+    0x0A: (0, 765),
+    0x0B: (0, 255),
+    0x0C: (0, 16383),
+    0x0D: (0, 255),
+    0x0E: (-64, 63.5),
+    0x0F: (-40, 215),
+    0x10: (0, 655.35),
+    0x11: (0, 100),
+    0x22: (0, 0.079 * 0xFFFF),
+    0x23: (0, 655350),
+    0x2C: (0, 100),
+    0x2D: (-100, 99.2),
+    0x2E: (0, 100),
+    0x21: (0, 65535),
+    0x30: (0, 255),
+    0x2F: (0, 100),
+    0x31: (0, 65535),
+    0x32: (-8192, 8191.75),
+    0x33: (0, 255),
+    0x3C: (-40, 6513.5),
+    0x3D: (-40, 6513.5),
+    0x3E: (-40, 6513.5),
+    0x3F: (-40, 6513.5),
+    0x42: (0, 65535),
+    0x43: (0, 100 * 0xFFFF / 255),
+    0x44: (0, 2),
+    0x45: (0, 100),
+    0x46: (-40, 215),
+    0x47: (0, 100),
+    0x48: (0, 100),
+    0x49: (0, 100),
+    0x4A: (0, 100),
+    0x4B: (0, 100),
+    0x4C: (0, 100),
+    0x4D: (0, 65535),
+    0x4E: (0, 65535),
+    0x52: (0, 100),
+    0x53: (0, 65.535),
+    0x54: (-32768, 32767),
+    0x59: (0, 655350),
+    0x5A: (0, 100),
+    0x5B: (0, 100),
+    0x5C: (-40, 215),
+    0x5D: (-210, 301.9921875),
+    0x5E: (0, 3212.75),
+    0x61: (-125, 130),
+    0x62: (-125, 130),
+    0x63: (0, 65535),
+    0x84: (-40, 215),
+    0xA6: (0, 0xFFFFFFFF / 10),
+    0xC7: (0, 65535),
+}
+
+MULTI_VALUE_PID_LIMITS = {
+    0x24: {
+        "lambda": (0, 2),
+        "voltage": (0, 8),
+    }
+}
+
+STANDARD_NUMERIC_ENCODINGS = {
+    0x06: (-100, 1.28, 1, "%", False),
+    0x07: (-100, 1.28, 1, "%", False),
+    0x08: (-100, 1.28, 1, "%", False),
+    0x09: (-100, 1.28, 1, "%", False),
+    0x0A: (0, 1 / 3, 1, "kPa", False),
+    0x0B: (0, 1, 1, "kPa", False),
+    0x0E: (-64, 2, 1, "degrees", False),
+    0x10: (0, 100, 2, "g/s", False),
+    0x21: (0, 1, 2, "km", False),
+    0x22: (0, 1 / 0.079, 2, "kPa", False),
+    0x23: (0, 0.1, 2, "kPa", False),
+    0x2C: (0, 2.55, 1, "%", False),
+    0x2D: (-100, 1.28, 1, "%", False),
+    0x2E: (0, 2.55, 1, "%", False),
+    0x30: (0, 1, 1, "warm-ups", False),
+    0x31: (0, 1, 2, "km", False),
+    0x32: (0, 4, 2, "Pa", True),
+    0x33: (0, 1, 1, "kPa", False),
+    0x3C: (-40, 10, 2, "C", False),
+    0x3D: (-40, 10, 2, "C", False),
+    0x3E: (-40, 10, 2, "C", False),
+    0x3F: (-40, 10, 2, "C", False),
+    0x43: (0, 255 / 100, 2, "%", False),
+    0x44: (0, 0xFFFF / 2, 2, "ratio", False),
+    0x45: (0, 2.55, 1, "%", False),
+    0x47: (0, 2.55, 1, "%", False),
+    0x48: (0, 2.55, 1, "%", False),
+    0x49: (0, 2.55, 1, "%", False),
+    0x4A: (0, 2.55, 1, "%", False),
+    0x4B: (0, 2.55, 1, "%", False),
+    0x4C: (0, 2.55, 1, "%", False),
+    0x4D: (0, 1, 2, "min", False),
+    0x4E: (0, 1, 2, "min", False),
+    0x52: (0, 2.55, 1, "%", False),
+    0x53: (0, 1000, 2, "kPa", False),
+    0x54: (0, 1, 2, "Pa", True),
+    0x59: (0, 0.1, 2, "kPa", False),
+    0x5A: (0, 2.55, 1, "%", False),
+    0x5B: (0, 2.55, 1, "%", False),
+    0x5D: (-210, 128, 2, "degrees", False),
+    0x5E: (0, 20, 2, "L/h", False),
+    0x61: (-125, 1, 1, "%", False),
+    0x62: (-125, 1, 1, "%", False),
+    0x63: (0, 1, 2, "Nm", False),
+    0x84: (-40, 1, 1, "C", False),
+    0xA6: (0, 10, 4, "km", False),
+    0xC7: (0, 1, 2, "km", False),
+}
+
+for _pid, (_pid_minimum, _pid_maximum) in NUMERIC_PID_LIMITS.items():
+    if _pid in PID_CATALOG and _pid in STANDARD_NUMERIC_ENCODINGS:
+        PID_CATALOG[_pid]["minimum"] = _pid_minimum
+        PID_CATALOG[_pid]["maximum"] = _pid_maximum
+        PID_CATALOG[_pid]["unit"] = STANDARD_NUMERIC_ENCODINGS[_pid][3]
+
+PID_CATALOG[0x24]["range_description"] = (
+    "Equivalence ratio: 0-2; sensor voltage: 0-8 V."
+)
 
 
 class SimulatorConfigError(ValueError):
@@ -283,7 +581,11 @@ def validate_config(config: dict) -> dict:
         normalized = {"supported": entry["supported"]}
         default_algorithm = "sweep" if pid in DEFAULT_SWEEPS else "standard"
         algorithm = entry.get("algorithm", default_algorithm)
-        allowed_algorithms = ("sweep", "raw") if pid in DEFAULT_SWEEPS else ("standard", "raw")
+        allowed_algorithms = (
+            ("sweep", "random", "raw")
+            if pid in NUMERIC_PID_LIMITS
+            else ("standard", "raw")
+        )
         if algorithm not in allowed_algorithms:
             raise SimulatorConfigError(
                 f"pids.{key}.algorithm must be one of {', '.join(allowed_algorithms)}."
@@ -294,12 +596,26 @@ def validate_config(config: dict) -> dict:
                 entry.get("raw_bytes"), f"pids.{key}.raw_bytes"
             )
             normalized["raw_bytes"] = " ".join(f"{byte:02X}" for byte in raw_bytes)
-        if pid in DEFAULT_SWEEPS:
-            sweep = entry.get("sweep", DEFAULT_SWEEPS[pid])
+        if algorithm in ("sweep", "random"):
+            default_sweep = DEFAULT_SWEEPS.get(
+                pid,
+                {
+                    "minimum": NUMERIC_PID_LIMITS[pid][0],
+                    "maximum": NUMERIC_PID_LIMITS[pid][1],
+                    "step": 1,
+                    "interval_s": 1,
+                },
+            )
+            sweep = entry.get("sweep", default_sweep)
             if not isinstance(sweep, dict):
                 raise SimulatorConfigError(f"pids.{key}.sweep must be an object.")
             values = {}
-            for field in ("minimum", "maximum", "step", "interval_s"):
+            fields = (
+                ("minimum", "maximum", "step", "interval_s")
+                if algorithm == "sweep"
+                else ("minimum", "maximum")
+            )
+            for field in fields:
                 try:
                     values[field] = float(sweep[field])
                 except (KeyError, TypeError, ValueError) as exc:
@@ -307,28 +623,18 @@ def validate_config(config: dict) -> dict:
                         f"pids.{key}.sweep.{field} must be numeric."
                     ) from exc
             if (
-                (values["minimum"] < 0 and pid not in (0x05, 0x0F, 0x46, 0x5C))
-                or values["maximum"] <= values["minimum"]
-                or values["step"] <= 0
-                or values["interval_s"] <= 0
+                values["minimum"] >= values["maximum"]
                 or not all(math.isfinite(value) for value in values.values())
+                or (
+                    algorithm == "sweep"
+                    and (values["step"] <= 0 or values["interval_s"] <= 0)
+                )
             ):
                 raise SimulatorConfigError(
-                    f"pids.{key}.sweep requires maximum > minimum and positive step/interval."
+                    f"pids.{key}.sweep requires a finite maximum greater than minimum"
+                    + (" and positive step/interval." if algorithm == "sweep" else ".")
                 )
-            limits = {
-                0x04: (0, 100),
-                0x05: (-40, 215),
-                0x0C: (0, 16383),
-                0x0D: (0, 255),
-                0x0F: (-40, 215),
-                0x11: (0, 100),
-                0x2F: (0, 100),
-                0x42: (0, 65535),
-                0x46: (-40, 215),
-                0x5C: (-40, 215),
-            }
-            lower, upper = limits[pid]
+            lower, upper = NUMERIC_PID_LIMITS[pid]
             if values["minimum"] < lower or values["maximum"] > upper:
                 raise SimulatorConfigError(
                     f"pids.{key}.sweep values must be between {lower} and {upper}."
@@ -355,20 +661,29 @@ def validate_config(config: dict) -> dict:
             raise SimulatorConfigError(f"pids.{canonical_key}.name must be text.")
         if not isinstance(unit, str):
             raise SimulatorConfigError(f"pids.{canonical_key}.unit must be text.")
-        if entry.get("algorithm") != "raw":
+        algorithm = entry.get("algorithm", "raw")
+        if algorithm not in ("raw", "sweep", "random") or (
+            algorithm != "raw"
+            and pid not in NUMERIC_PID_LIMITS
+            and pid not in MULTI_VALUE_PID_LIMITS
+        ):
             raise SimulatorConfigError(
-                f"pids.{canonical_key}.algorithm must be 'raw' for custom PIDs."
+                f"pids.{canonical_key}.algorithm must be 'raw' "
+                "or a numeric algorithm supported for this PID."
             )
-        raw_bytes = _parse_raw_bytes(
-            entry.get("raw_bytes"), f"pids.{canonical_key}.raw_bytes"
-        )
         normalized = {
             "supported": entry["supported"],
             "name": name.strip(),
             "unit": unit.strip(),
-            "algorithm": "raw",
-            "raw_bytes": " ".join(f"{byte:02X}" for byte in raw_bytes),
+            "algorithm": algorithm,
         }
+        if algorithm == "raw":
+            raw_bytes = _parse_raw_bytes(
+                entry.get("raw_bytes"), f"pids.{canonical_key}.raw_bytes"
+            )
+            normalized["raw_bytes"] = " ".join(
+                f"{byte:02X}" for byte in raw_bytes
+            )
         service = entry.get("service")
         if service is not None:
             if service != "01":
@@ -412,6 +727,115 @@ def validate_config(config: dict) -> dict:
                 )
             normalized["minimum"] = minimum
             normalized["maximum"] = maximum
+        if algorithm in ("sweep", "random"):
+            if pid in MULTI_VALUE_PID_LIMITS:
+                field_ranges = MULTI_VALUE_PID_LIMITS[pid]
+                default_sweep = {
+                    f"{field}_{bound}": limit
+                    for field, bounds in field_ranges.items()
+                    for bound, limit in zip(("minimum", "maximum"), bounds)
+                }
+                default_sweep.update(
+                    {
+                        f"{field}_step": (bounds[1] - bounds[0]) / 10
+                        for field, bounds in field_ranges.items()
+                    }
+                )
+                default_sweep["interval_s"] = 1
+                sweep = entry.get("sweep", default_sweep)
+                if not isinstance(sweep, dict):
+                    raise SimulatorConfigError(
+                        f"pids.{canonical_key}.sweep must be an object."
+                    )
+                values = {}
+                fields = []
+                for field, (lower, upper) in field_ranges.items():
+                    fields.extend((f"{field}_minimum", f"{field}_maximum"))
+                    if algorithm == "sweep":
+                        fields.append(f"{field}_step")
+                if algorithm == "sweep":
+                    fields.append("interval_s")
+                for field in fields:
+                    try:
+                        values[field] = float(sweep[field])
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise SimulatorConfigError(
+                            f"pids.{canonical_key}.sweep.{field} must be numeric."
+                        ) from exc
+                for field, (lower, upper) in field_ranges.items():
+                    minimum = values[f"{field}_minimum"]
+                    maximum = values[f"{field}_maximum"]
+                    if (
+                        not math.isfinite(minimum)
+                        or not math.isfinite(maximum)
+                        or minimum >= maximum
+                        or minimum < lower
+                        or maximum > upper
+                    ):
+                        raise SimulatorConfigError(
+                            f"pids.{canonical_key}.sweep {field} boundaries must "
+                            f"satisfy {lower} <= minimum < maximum <= {upper}."
+                        )
+                    step_key = f"{field}_step"
+                    if algorithm == "sweep" and (
+                        not math.isfinite(values[step_key]) or values[step_key] <= 0
+                    ):
+                        raise SimulatorConfigError(
+                            f"pids.{canonical_key}.sweep.{step_key} must be positive."
+                        )
+                if algorithm == "sweep" and (
+                    not math.isfinite(values["interval_s"])
+                    or values["interval_s"] <= 0
+                ):
+                    raise SimulatorConfigError(
+                        f"pids.{canonical_key}.sweep.interval_s must be positive."
+                    )
+                normalized["sweep"] = values
+                normalized_pids[canonical_key] = normalized
+                continue
+            default_sweep = {
+                "minimum": normalized.get("minimum", NUMERIC_PID_LIMITS[pid][0]),
+                "maximum": normalized.get("maximum", NUMERIC_PID_LIMITS[pid][1]),
+                "step": 1,
+                "interval_s": 1,
+            }
+            sweep = entry.get("sweep", default_sweep)
+            if not isinstance(sweep, dict):
+                raise SimulatorConfigError(
+                    f"pids.{canonical_key}.sweep must be an object."
+                )
+            fields = (
+                ("minimum", "maximum", "step", "interval_s")
+                if algorithm == "sweep"
+                else ("minimum", "maximum")
+            )
+            values = {}
+            for field in fields:
+                try:
+                    values[field] = float(sweep[field])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise SimulatorConfigError(
+                        f"pids.{canonical_key}.sweep.{field} must be numeric."
+                    ) from exc
+            if (
+                values["minimum"] >= values["maximum"]
+                or not all(math.isfinite(value) for value in values.values())
+                or (
+                    algorithm == "sweep"
+                    and (values["step"] <= 0 or values["interval_s"] <= 0)
+                )
+            ):
+                raise SimulatorConfigError(
+                    f"pids.{canonical_key}.sweep requires a finite maximum greater "
+                    "than minimum"
+                    + (" and positive step/interval." if algorithm == "sweep" else ".")
+                )
+            lower, upper = NUMERIC_PID_LIMITS[pid]
+            if values["minimum"] < lower or values["maximum"] > upper:
+                raise SimulatorConfigError(
+                    f"pids.{canonical_key}.sweep values must be between {lower} and {upper}."
+                )
+            normalized["sweep"] = values
         normalized_pids[canonical_key] = normalized
 
     dtcs = config.get("dtcs", [])
@@ -492,6 +916,8 @@ class EcuSimulator:
         self.config = validate_config(config)
         self._clock = clock
         self._started_at = clock()
+        self._dtcs_cleared = False
+        self._random_values = {}
 
     @property
     def request_ids(self) -> Tuple[int, ...]:
@@ -520,7 +946,13 @@ class EcuSimulator:
     def reset_clock(self) -> None:
         self._started_at = self._clock()
 
-    def current_value(self, pid: int) -> Tuple[str, bytes]:
+    def start_session(self) -> None:
+        self.reset_clock()
+        self._dtcs_cleared = False
+
+    def current_value(
+        self, pid: int, refresh_random: bool = False
+    ) -> Tuple[str, bytes]:
         entry = self.config["pids"].get(f"{pid:02X}")
         if entry is None:
             raise ValueError(f"PID 0x{pid:02X} is not implemented.")
@@ -534,19 +966,44 @@ class EcuSimulator:
             raw = bytes.fromhex(entry["raw_bytes"])
             return f"Raw bytes {raw.hex(' ').upper()}", raw
 
+        if pid in STANDARD_NUMERIC_ENCODINGS:
+            value = self._value(pid, refresh_random)
+            offset, scale, byte_count, unit, signed = STANDARD_NUMERIC_ENCODINGS[pid]
+            bits = byte_count * 8
+            encoded = round((value - offset) * scale)
+            lower = -(1 << (bits - 1)) if signed else 0
+            upper = (1 << (bits - 1)) - 1 if signed else (1 << bits) - 1
+            encoded = min(max(encoded, lower), upper)
+            raw = (encoded & ((1 << bits) - 1)).to_bytes(byte_count, "big")
+            value = encoded / scale + offset
+            display = f"{value:g} {unit}".strip()
+            return display, raw
+
+        if pid in MULTI_VALUE_PID_LIMITS:
+            lambda_value, voltage_value = self._multi_value(pid, refresh_random)
+            lambda_raw = min(round(lambda_value / 2 * 65536), 0xFFFF)
+            voltage_raw = min(round(voltage_value / 8 * 65536), 0xFFFF)
+            raw = lambda_raw.to_bytes(2, "big") + voltage_raw.to_bytes(2, "big")
+            return f"{lambda_value:g} lambda, {voltage_value:g} V", raw
+
         name, unit, kind = PID_DEFINITIONS[pid]
         if kind == "status":
-            active_dtcs = sum(dtc["active"] for dtc in self.config["dtcs"])
-            status = (0x80 if self.config["mil_on"] else 0) | active_dtcs
+            active_dtcs = (
+                0
+                if self._dtcs_cleared
+                else sum(dtc["active"] for dtc in self.config["dtcs"])
+            )
+            mil_on = self.config["mil_on"] and not self._dtcs_cleared
+            status = (0x80 if mil_on else 0) | active_dtcs
             raw = bytes((status, 0, 0, 0))
-            return f"MIL {'on' if self.config['mil_on'] else 'off'}; {active_dtcs} DTCs", raw
+            return f"MIL {'on' if mil_on else 'off'}; {active_dtcs} DTCs", raw
 
         if kind == "runtime":
             seconds = min(int(self._clock() - self._started_at), 0xFFFF)
             raw = seconds.to_bytes(2, "big")
             return f"{seconds} {unit}", raw
 
-        value = self._value(pid)
+        value = self._value(pid, refresh_random)
         if kind == "load":
             raw = bytes((round(value * 255 / 100),))
             display = f"{value:.0f} {unit}"
@@ -573,16 +1030,50 @@ class EcuSimulator:
             raise ValueError(f"PID 0x{pid:02X} has no encoder.")
         return display, raw
 
-    def _value(self, pid: int) -> float:
-        spec = self.config["pids"][f"{pid:02X}"]["sweep"]
+    def _value(self, pid: int, refresh_random: bool = False) -> float:
+        entry = self.config["pids"][f"{pid:02X}"]
+        spec = entry.get("sweep", DEFAULT_SWEEPS.get(pid))
+        if spec is None:
+            raise ValueError(f"PID 0x{pid:02X} has no numeric value range.")
         minimum = spec["minimum"]
         maximum = spec["maximum"]
+        if entry.get("algorithm") == "random":
+            if refresh_random:
+                self._random_values[pid] = random.uniform(minimum, maximum)
+            return self._random_values.get(pid, minimum)
         step = spec["step"]
         interval = spec["interval_s"]
         steps = max(1, math.ceil((maximum - minimum) / step))
         phase = int((self._clock() - self._started_at) / interval) % (steps * 2)
         position = phase if phase <= steps else steps * 2 - phase
         return min(minimum + position * step, maximum)
+
+    def _multi_value(
+        self, pid: int, refresh_random: bool
+    ) -> Tuple[float, float]:
+        entry = self.config["pids"][f"{pid:02X}"]
+        spec = entry["sweep"]
+        if entry["algorithm"] == "random":
+            if refresh_random:
+                self._random_values[pid] = (
+                    random.uniform(spec["lambda_minimum"], spec["lambda_maximum"]),
+                    random.uniform(spec["voltage_minimum"], spec["voltage_maximum"]),
+                )
+            return self._random_values.get(
+                pid, (spec["lambda_minimum"], spec["voltage_minimum"])
+            )
+
+        elapsed = self._clock() - self._started_at
+        values = []
+        for field in ("lambda", "voltage"):
+            minimum = spec[f"{field}_minimum"]
+            maximum = spec[f"{field}_maximum"]
+            step = spec[f"{field}_step"]
+            steps = max(1, math.ceil((maximum - minimum) / step))
+            phase = int(elapsed / spec["interval_s"]) % (steps * 2)
+            position = phase if phase <= steps else steps * 2 - phase
+            values.append(min(minimum + position * step, maximum))
+        return values[0], values[1]
 
     def supported_bitmap(self, page: int) -> bytes:
         if page not in PID_BITMAP_PAGES:
@@ -619,15 +1110,22 @@ class EcuSimulator:
         if not payload:
             return None
         if payload[0] == 0x03 and len(payload) == 1:
-            active_dtcs = [dtc["code"] for dtc in self.config["dtcs"] if dtc["active"]]
+            active_dtcs = (
+                []
+                if self._dtcs_cleared
+                else [dtc["code"] for dtc in self.config["dtcs"] if dtc["active"]]
+            )
             encoded_codes = b"".join(self._encode_dtc(code) for code in active_dtcs)
             response_data = bytes((0x43,)) + encoded_codes
+        elif payload[0] == 0x04 and len(payload) == 1:
+            self._dtcs_cleared = True
+            response_data = bytes((0x44,))
         elif payload[0] == 0x01 and len(payload) >= 2:
             pid = payload[1]
             if pid in PID_BITMAP_PAGES and self.is_supported(pid):
                 data = self.supported_bitmap(pid)
             elif self.is_supported(pid):
-                _display, data = self.current_value(pid)
+                _display, data = self.current_value(pid, refresh_random=True)
             else:
                 return None
             response_data = bytes((0x41, pid)) + data

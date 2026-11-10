@@ -100,3 +100,12 @@ def parse_frame(line: str) -> CanFrame:
 
 def is_frame_line(line: str) -> bool:
     return bool(line) and line[0] in "tTrR"
+
+
+def estimate_can_frame_bits(frame: CanFrame) -> int:
+    """Estimate Classical CAN wire bits, including average bit stuffing."""
+    arbitration_bits = 32 if frame.extended else 12
+    fixed_bits = 67 if frame.extended else 47
+    stuffable_bits = 1 + arbitration_bits + 6 + frame.dlc * 8 + 15
+    estimated_stuff_bits = (stuffable_bits + 4) // 5
+    return fixed_bits + frame.dlc * 8 + estimated_stuff_bits

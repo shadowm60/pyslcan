@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ecu_simulator import (
     EcuSimulator,
@@ -103,6 +104,37 @@ class EcuSimulatorTests(unittest.TestCase):
             ("800 rpm", "900 rpm", "1000 rpm", "900 rpm"),
         )
 
+    def test_random_algorithm_changes_only_when_that_pid_is_requested(self):
+        config = default_config()
+        config["pids"]["0C"]["algorithm"] = "random"
+        config["pids"]["0C"]["sweep"] = {
+            "minimum": 800,
+            "maximum": 1200,
+        }
+        simulator = EcuSimulator(config, clock=lambda: self.now)
+        rpm_request = CanFrame(
+            0x7DF, False, False, 8, bytes((2, 1, 0x0C, 0, 0, 0, 0, 0))
+        )
+        speed_request = CanFrame(
+            0x7DF, False, False, 8, bytes((2, 1, 0x0D, 0, 0, 0, 0, 0))
+        )
+
+        with patch("ecu_simulator.random.uniform", side_effect=(1000, 1200)) as choose:
+            self.assertEqual(simulator.current_value(0x0C)[0], "800 rpm")
+            simulator.display_rows()
+            self.assertEqual(choose.call_count, 0)
+
+            first_response = simulator.handle_request(rpm_request)
+            simulator.handle_request(speed_request)
+            self.assertEqual(simulator.current_value(0x0C)[0], "1000 rpm")
+            self.assertEqual(choose.call_count, 1)
+
+            second_response = simulator.handle_request(rpm_request)
+            self.assertEqual(choose.call_count, 2)
+
+        self.assertEqual(first_response.data, bytes((4, 0x41, 0x0C, 0x0F, 0xA0, 0, 0, 0)))
+        self.assertEqual(second_response.data, bytes((4, 0x41, 0x0C, 0x12, 0xC0, 0, 0, 0)))
+
     def test_config_round_trip_and_invalid_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ecu.json"
@@ -124,6 +156,126 @@ class EcuSimulatorTests(unittest.TestCase):
         self.assertEqual((trim["minimum"], trim["maximum"]), (-100, 99.2))
         self.assertEqual(trim["default_raw_bytes"], "80")
         self.assertEqual(PID_CATALOG[0x02]["range_description"], "Two-byte DTC encoding")
+
+    def test_standard_mode01_pid_24_is_catalogued_and_uses_four_raw_bytes(self):
+        catalog_entry = PID_CATALOG[0x24]
+        self.assertIn("oxygen sensor 1", catalog_entry["name"].lower())
+        self.assertEqual(catalog_entry["default_raw_bytes"], "00 00 00 00")
+        self.assertIn("mass air flow", PID_CATALOG[0x50]["name"].lower())
+
+        config = default_config()
+        config["pids"]["24"] = {
+            "name": catalog_entry["name"],
+            "unit": catalog_entry["unit"],
+            "supported": True,
+            "algorithm": "raw",
+            "raw_bytes": catalog_entry["default_raw_bytes"],
+        }
+        request = CanFrame(0x7DF, False, False, 8, bytes((2, 1, 0x24, 0, 0, 0, 0, 0)))
+
+        response = EcuSimulator(config).handle_request(request)
+
+        self.assertEqual(response.data, bytes((6, 0x41, 0x24, 0, 0, 0, 0, 0)))
+
+    def test_pid24_sweep_encodes_lambda_and_voltage_with_separate_ranges(self):
+        config = default_config()
+        config["pids"]["24"] = {
+            "name": PID_CATALOG[0x24]["name"],
+            "unit": "",
+            "supported": True,
+            "algorithm": "sweep",
+            "sweep": {
+                "lambda_minimum": 0,
+                "lambda_maximum": 2,
+                "lambda_step": 1,
+                "voltage_minimum": 0,
+                "voltage_maximum": 8,
+                "voltage_step": 4,
+                "interval_s": 1,
+            },
+        }
+        simulator = EcuSimulator(config, clock=lambda: self.now)
+        request = CanFrame(
+            0x7DF, False, False, 8, bytes((2, 1, 0x24, 0, 0, 0, 0, 0))
+        )
+
+        initial = simulator.handle_request(request)
+        self.now += 1
+        middle = simulator.handle_request(request)
+        self.now += 1
+        maximum = simulator.handle_request(request)
+
+        self.assertEqual(initial.data, bytes((6, 0x41, 0x24, 0, 0, 0, 0, 0)))
+        self.assertEqual(middle.data, bytes((6, 0x41, 0x24, 0x80, 0, 0x80, 0, 0)))
+        self.assertEqual(maximum.data, bytes((6, 0x41, 0x24, 0xFF, 0xFF, 0xFF, 0xFF, 0)))
+
+    def test_pid24_randomizes_lambda_and_voltage_only_when_requested(self):
+        config = default_config()
+        config["pids"]["24"] = {
+            "name": PID_CATALOG[0x24]["name"],
+            "unit": "",
+            "supported": True,
+            "algorithm": "random",
+            "sweep": {
+                "lambda_minimum": 0.5,
+                "lambda_maximum": 1.5,
+                "voltage_minimum": 1,
+                "voltage_maximum": 5,
+            },
+        }
+        simulator = EcuSimulator(config, clock=lambda: self.now)
+        request = CanFrame(
+            0x7DF, False, False, 8, bytes((2, 1, 0x24, 0, 0, 0, 0, 0))
+        )
+
+        with patch(
+            "ecu_simulator.random.uniform", side_effect=(1.0, 4.0, 1.5, 5.0)
+        ) as choose:
+            simulator.current_value(0x24)
+            simulator.display_rows()
+            self.assertEqual(choose.call_count, 0)
+            first = simulator.handle_request(request)
+            second = simulator.handle_request(request)
+
+        self.assertEqual(first.data, bytes((6, 0x41, 0x24, 0x80, 0, 0x80, 0, 0)))
+        self.assertEqual(second.data, bytes((6, 0x41, 0x24, 0xC0, 0, 0xA0, 0, 0)))
+        self.assertEqual(choose.call_count, 4)
+
+    def test_pid24_validates_independent_boundaries_and_round_trips_config(self):
+        config = default_config()
+        config["pids"]["24"] = {
+            "name": PID_CATALOG[0x24]["name"],
+            "unit": "",
+            "supported": True,
+            "algorithm": "sweep",
+            "sweep": {
+                "lambda_minimum": 0.2,
+                "lambda_maximum": 1.8,
+                "lambda_step": 0.2,
+                "voltage_minimum": 0.5,
+                "voltage_maximum": 7.5,
+                "voltage_step": 0.5,
+                "interval_s": 0.25,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ecu.json"
+            save_config(path, config)
+            loaded = load_config(path)
+
+        self.assertEqual(loaded["pids"]["24"]["algorithm"], "sweep")
+        self.assertEqual(
+            loaded["pids"]["24"]["sweep"]["voltage_maximum"], 7.5
+        )
+
+        config["pids"]["24"]["sweep"]["lambda_maximum"] = 2.1
+        with self.assertRaisesRegex(SimulatorConfigError, "lambda boundaries"):
+            EcuSimulator(config)
+
+    def test_multi_frame_standard_pid_is_catalogued_but_not_enabled_by_default(self):
+        self.assertEqual(PID_CATALOG[0x6E]["default_supported"], False)
+        self.assertIn("multi-frame", PID_CATALOG[0x6E]["range_description"])
 
     def test_custom_pid_catalog_metadata_survives_config_round_trip(self):
         config = default_config()
@@ -153,6 +305,61 @@ class EcuSimulatorTests(unittest.TestCase):
         self.assertEqual(stored["minimum"], -100)
         self.assertEqual(stored["maximum"], 99.2)
         self.assertEqual(stored["default_raw_bytes"], "80")
+
+    def test_catalog_numeric_pid_accepts_sweep_and_random_algorithms(self):
+        for algorithm in ("sweep", "random"):
+            config = default_config()
+            catalog_entry = PID_CATALOG[0x06]
+            config["pids"]["06"] = {
+                "name": catalog_entry["name"],
+                "unit": catalog_entry["unit"],
+                "supported": True,
+                "algorithm": algorithm,
+                "minimum": catalog_entry["minimum"],
+                "maximum": catalog_entry["maximum"],
+                "sweep": {
+                    "minimum": -50,
+                    "maximum": 50,
+                    **({"step": 10, "interval_s": 1} if algorithm == "sweep" else {}),
+                },
+            }
+
+            simulator = EcuSimulator(config)
+
+            self.assertEqual(simulator.current_value(0x06)[1], b"\x40")
+
+    def test_numeric_catalog_random_values_use_each_pid_conversion(self):
+        test_cases = (
+            (0x06, -100, 99.2, 0, b"\x80"),
+            (0x22, 0, 0.079 * 0xFFFF, 79, b"\x03\xE8"),
+            (0x54, -32768, 32767, -1, b"\xFF\xFF"),
+            (0xA6, 0, 0xFFFFFFFF / 10, 1.2, b"\x00\x00\x00\x0C"),
+        )
+
+        for pid, minimum, maximum, random_value, expected_bytes in test_cases:
+            with self.subTest(pid=pid):
+                catalog_entry = PID_CATALOG[pid]
+                config = default_config()
+                config["pids"][f"{pid:02X}"] = {
+                    "name": catalog_entry["name"],
+                    "unit": catalog_entry["unit"],
+                    "supported": True,
+                    "algorithm": "random",
+                    "minimum": minimum,
+                    "maximum": maximum,
+                    "sweep": {"minimum": minimum, "maximum": maximum},
+                }
+                request = CanFrame(
+                    0x7DF, False, False, 8, bytes((2, 1, pid, 0, 0, 0, 0, 0))
+                )
+                simulator = EcuSimulator(config)
+
+                with patch(
+                    "ecu_simulator.random.uniform", return_value=random_value
+                ):
+                    response = simulator.handle_request(request)
+
+                self.assertEqual(response.data[3 : 3 + len(expected_bytes)], expected_bytes)
 
     def test_custom_pid_catalog_metadata_rejects_invalid_range(self):
         config = default_config()
@@ -233,6 +440,41 @@ class EcuSimulatorTests(unittest.TestCase):
         self.assertEqual(status.data, bytes((6, 0x41, 1, 0x82, 0, 0, 0, 0)))
         self.assertEqual(
             dtcs.data, bytes((5, 0x43, 0x01, 0x33, 0x04, 0x20, 0, 0))
+        )
+
+    def test_mode04_clears_reported_dtcs_until_the_next_simulation_session(self):
+        config = default_config()
+        config["mil_on"] = True
+        config["dtcs"][0]["active"] = True
+        config["dtcs"][2]["active"] = True
+        simulator = EcuSimulator(config, clock=lambda: self.now)
+        clear_request = CanFrame(
+            0x7DF, False, False, 8, bytes((1, 4, 0, 0, 0, 0, 0, 0))
+        )
+        status_request = CanFrame(
+            0x7DF, False, False, 8, bytes((2, 1, 1, 0, 0, 0, 0, 0))
+        )
+        dtc_request = CanFrame(
+            0x7DF, False, False, 8, bytes((1, 3, 0, 0, 0, 0, 0, 0))
+        )
+
+        clear_response = simulator.handle_request(clear_request)
+        status = simulator.handle_request(status_request)
+        dtcs = simulator.handle_request(dtc_request)
+
+        self.assertEqual(clear_response.data, bytes((1, 0x44, 0, 0, 0, 0, 0, 0)))
+        self.assertEqual(status.data, bytes((6, 0x41, 1, 0, 0, 0, 0, 0)))
+        self.assertEqual(dtcs.data, bytes((1, 0x43, 0, 0, 0, 0, 0, 0)))
+
+        simulator.start_session()
+
+        self.assertEqual(
+            simulator.handle_request(status_request).data,
+            bytes((6, 0x41, 1, 0x82, 0, 0, 0, 0)),
+        )
+        self.assertEqual(
+            simulator.handle_request(dtc_request).data,
+            bytes((5, 0x43, 0x01, 0x33, 0x04, 0x20, 0, 0)),
         )
 
     def test_raw_algorithm_overrides_builtin_pid_bytes(self):

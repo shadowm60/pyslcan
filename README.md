@@ -87,6 +87,15 @@ The device protocol is implemented in `slcan_protocol.py`; serial I/O runs on
 a background worker so the UI remains responsive. `CanFrame` is the frame
 representation intended to be reused by future DBC or OBD-II decoders.
 
+## Estimated CAN bus load
+
+The monitor shows a rolling 10-second utilization estimate at the selected CAN
+bitrate. It counts frames observed by the adapter in both directions and
+estimates Classical CAN frame bits, including protocol overhead and approximate
+bit stuffing. Frames hidden by adapter filters or traffic not received by the
+app are not counted, so this is an estimate of observed traffic rather than a
+measurement of total physical bus utilization.
+
 ## OBD-II ECU simulator
 
 The ECU configuration can be edited in the GUI while disconnected; the
@@ -96,22 +105,36 @@ accepts functional requests on `0x7DF` and physical requests on `0x7E0`, and
 replies on `0x7E8`. Unsupported PIDs receive no response.
 
 The **Mode 01 PIDs** tab lets you toggle support, edit built-in signal sweeps
-(minimum, maximum, step, and interval), switch a built-in PID to fixed raw
-bytes, and add or remove custom PIDs. A custom PID has a name, unit, support
-flag, and one-to-five raw response bytes. Supported-PID bitmaps are regenerated
+(minimum, maximum, step, and interval), select on-read random values for
+supported numeric PIDs, switch a PID to fixed raw bytes, and add or remove
+custom PIDs. Random values are generated only when that PID is requested, not
+on a timer. Numeric standard PIDs with known single-value encodings offer
+sweep, random, and raw algorithms; compound/status PIDs remain raw. Custom
+vendor PIDs have a name, unit, support flag, and one-to-five raw response bytes.
+Supported-PID bitmaps are regenerated
 from the configured support flags, including continuation pages through
 `0xE0`. PID `0x00` and multiples of `0x20` are reserved for these bitmaps.
 The table displays both the current engineering value and raw encoded bytes.
-When adding a PID, the editor offers common standardized Mode 01 PIDs with
-their function, measurement, unit, valid range, and suggested raw bytes.
-Selecting one stores that reference information with the custom PID. The
-catalog is a guide, not a complete OBD-II PID list; unlisted PIDs can still be
-entered manually, and the simulator currently responds only to Mode 01.
+When adding a PID, the editor offers standardized Mode 01 PIDs by number and
+name, including suggested raw response bytes. Catalog entries with supported
+numeric encoders also provide physical ranges and standard byte conversion.
+PID `0x24` offers independent sweep/random bounds for equivalence ratio
+(`0`-`2`) and sensor voltage (`0`-`8 V`).
+Entries needing more than five response bytes are identified as requiring
+multi-frame CAN and are disabled by default because the simulator currently
+sends single frames.
+The list is based on the [OBD-II PID reference](https://en.wikipedia.org/wiki/OBD-II_PIDs);
+manufacturer-specific or otherwise unlisted PIDs can still be entered manually.
+The simulator responds to Mode 01 data, Mode 03 DTC queries, and Mode 04
+clear-DTC requests.
 
 The **Active DTCs (Mode 03)** tab lists configured codes and lets you add,
 edit, remove, and activate them. The **MIL on** checkbox controls the MIL bit
 independently; PID `0x01` also reports the number of active DTCs. Mode 03 uses
-a single CAN frame, so at most three DTCs can be active at once.
+a single CAN frame, so at most three DTCs can be active at once. A Mode 04
+clear-DTC request receives a positive response and suppresses configured DTCs
+and the MIL status for the remainder of that simulator session. Starting a new
+simulator session makes the configured DTCs reportable again.
 
 `ecu_simulator.json` stores request/response CAN IDs, PID definitions,
 algorithms and sweep boundaries, the `mil_on` flag, and DTC descriptions and

@@ -1,12 +1,25 @@
 import unittest
 
-from slcan_protocol import BITRATES, CanFrame, encode_frame, parse_frame
+from slcan_protocol import (
+    BITRATES,
+    CanFrame,
+    encode_frame,
+    estimate_can_frame_bits,
+    parse_frame,
+)
 
 
 class SlcanProtocolTests(unittest.TestCase):
     def test_bitrate_table(self):
         self.assertEqual(BITRATES["S0"], 10_000)
         self.assertEqual(BITRATES["S8"], 1_000_000)
+
+    def test_estimates_classic_can_frame_wire_bits(self):
+        standard = CanFrame(0x123, False, False, 8, bytes(8))
+        extended = CanFrame(0x1234567, True, False, 8, bytes(8))
+
+        self.assertEqual(estimate_can_frame_bits(standard), 131)
+        self.assertEqual(estimate_can_frame_bits(extended), 155)
 
     def test_standard_data_frame_round_trip(self):
         frame = CanFrame(0x123, False, False, 2, bytes.fromhex("DE AD"))

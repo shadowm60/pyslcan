@@ -1,3 +1,4 @@
+from collections import deque
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +39,20 @@ class FakeStatus(FakeVariable):
 
 
 class AppPortTests(unittest.TestCase):
+    def test_bus_load_is_a_rolling_ten_second_estimate(self):
+        app = SlcanApp.__new__(SlcanApp)
+        app.bus_load_var = FakeVariable()
+        app._bus_load_bitrate = 500_000
+        app._bus_load_samples = deque(((5.0, 50_000),))
+
+        with patch("app.time.monotonic", return_value=10.0):
+            app._update_bus_load()
+        self.assertIn("1.00% over the last 10 s", app.bus_load_var.get())
+
+        with patch("app.time.monotonic", return_value=16.0):
+            app._update_bus_load()
+        self.assertIn("0.00% over the last 10 s", app.bus_load_var.get())
+
     def test_selects_new_bluetooth_port_by_description(self):
         app = SlcanApp.__new__(SlcanApp)
         app.port_combo = FakeCombo(("COM1 - Existing serial port",))
