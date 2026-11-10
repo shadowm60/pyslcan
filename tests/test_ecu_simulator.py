@@ -35,7 +35,45 @@ class EcuSimulatorTests(unittest.TestCase):
 
         self.assertEqual(response.arbitration_id, 0x7E8)
         self.assertEqual(response.dlc, 8)
-        self.assertEqual(response.data, bytes((4, 0x41, 0x0C, 0x0C, 0x80, 0, 0, 0)))
+        self.assertEqual(
+            response.data, bytes((4, 0x41, 0x0C, 0x0C, 0x80, 0x55, 0x55, 0x55))
+        )
+
+    def test_multi_pid_responses_are_configurable_and_preserve_request_order(self):
+        request = CanFrame(
+            0x7DF, False, False, 8, bytes((3, 1, 0x0C, 0x0D, 0, 0, 0, 0))
+        )
+
+        self.assertEqual(
+            self.simulator.handle_request_payload(request),
+            bytes((0x41, 0x0C, 0x0C, 0x80)),
+        )
+
+        config = default_config()
+        config["multi_pid_response_active"] = True
+        simulator = EcuSimulator(config, clock=lambda: self.now)
+        self.assertEqual(
+            simulator.handle_request_payload(request),
+            bytes((0x41, 0x0C, 0x0C, 0x80, 0x0D, 0x00)),
+        )
+
+    def test_multi_pid_responses_skip_unsupported_pids_and_refresh_only_requested(self):
+        config = default_config()
+        config["multi_pid_response_active"] = True
+        config["pids"]["04"]["algorithm"] = "random"
+        config["pids"]["0C"]["algorithm"] = "random"
+        config["pids"]["0D"]["supported"] = False
+        request = CanFrame(
+            0x7DF, False, False, 8, bytes((4, 1, 0x04, 0x0D, 0x0C, 0, 0, 0))
+        )
+
+        with patch("ecu_simulator.random.uniform", side_effect=(30, 1200)) as choose:
+            response = EcuSimulator(config, clock=lambda: self.now).handle_request_payload(
+                request
+            )
+
+        self.assertEqual(response, bytes((0x41, 0x04, 0x4C, 0x0C, 0x12, 0xC0)))
+        self.assertEqual(choose.call_count, 2)
 
     def test_physical_request_is_accepted_and_unsupported_pid_is_ignored(self):
         request = CanFrame(0x7E0, False, False, 8, bytes((2, 1, 0x0C, 0, 0, 0, 0, 0)))
@@ -71,7 +109,7 @@ class EcuSimulatorTests(unittest.TestCase):
 
         self.assertEqual(
             response.data,
-            bytes((6, 0x41, 0x00, 0x98, 0x1A, 0x80, 0x03, 0)),
+            bytes((6, 0x41, 0x00, 0x98, 0x1A, 0x80, 0x03, 0x55)),
         )
 
     def test_display_rows_include_live_values_for_supported_pids(self):
@@ -132,8 +170,14 @@ class EcuSimulatorTests(unittest.TestCase):
             second_response = simulator.handle_request(rpm_request)
             self.assertEqual(choose.call_count, 2)
 
-        self.assertEqual(first_response.data, bytes((4, 0x41, 0x0C, 0x0F, 0xA0, 0, 0, 0)))
-        self.assertEqual(second_response.data, bytes((4, 0x41, 0x0C, 0x12, 0xC0, 0, 0, 0)))
+        self.assertEqual(
+            first_response.data,
+            bytes((4, 0x41, 0x0C, 0x0F, 0xA0, 0x55, 0x55, 0x55)),
+        )
+        self.assertEqual(
+            second_response.data,
+            bytes((4, 0x41, 0x0C, 0x12, 0xC0, 0x55, 0x55, 0x55)),
+        )
 
     def test_config_round_trip_and_invalid_ids(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -143,6 +187,12 @@ class EcuSimulatorTests(unittest.TestCase):
             self.assertEqual(loaded["request_ids"], [0x7DF, 0x7E0])
             self.assertEqual(loaded["response_id"], 0x7E8)
             self.assertEqual(len(loaded["dtcs"]), 3)
+            self.assertFalse(loaded["multi_pid_response_active"])
+
+            config = default_config()
+            config["multi_pid_response_active"] = True
+            save_config(path, config)
+            self.assertTrue(load_config(path)["multi_pid_response_active"])
 
             raw = json.loads(path.read_text(encoding="utf-8"))
             raw["response_id"] = "0x800"
@@ -175,7 +225,9 @@ class EcuSimulatorTests(unittest.TestCase):
 
         response = EcuSimulator(config).handle_request(request)
 
-        self.assertEqual(response.data, bytes((6, 0x41, 0x24, 0, 0, 0, 0, 0)))
+        self.assertEqual(
+            response.data, bytes((6, 0x41, 0x24, 0, 0, 0, 0, 0x55))
+        )
 
     def test_pid24_sweep_encodes_lambda_and_voltage_with_separate_ranges(self):
         config = default_config()
@@ -205,9 +257,16 @@ class EcuSimulatorTests(unittest.TestCase):
         self.now += 1
         maximum = simulator.handle_request(request)
 
-        self.assertEqual(initial.data, bytes((6, 0x41, 0x24, 0, 0, 0, 0, 0)))
-        self.assertEqual(middle.data, bytes((6, 0x41, 0x24, 0x80, 0, 0x80, 0, 0)))
-        self.assertEqual(maximum.data, bytes((6, 0x41, 0x24, 0xFF, 0xFF, 0xFF, 0xFF, 0)))
+        self.assertEqual(
+            initial.data, bytes((6, 0x41, 0x24, 0, 0, 0, 0, 0x55))
+        )
+        self.assertEqual(
+            middle.data, bytes((6, 0x41, 0x24, 0x80, 0, 0x80, 0, 0x55))
+        )
+        self.assertEqual(
+            maximum.data,
+            bytes((6, 0x41, 0x24, 0xFF, 0xFF, 0xFF, 0xFF, 0x55)),
+        )
 
     def test_pid24_randomizes_lambda_and_voltage_only_when_requested(self):
         config = default_config()
@@ -237,8 +296,12 @@ class EcuSimulatorTests(unittest.TestCase):
             first = simulator.handle_request(request)
             second = simulator.handle_request(request)
 
-        self.assertEqual(first.data, bytes((6, 0x41, 0x24, 0x80, 0, 0x80, 0, 0)))
-        self.assertEqual(second.data, bytes((6, 0x41, 0x24, 0xC0, 0, 0xA0, 0, 0)))
+        self.assertEqual(
+            first.data, bytes((6, 0x41, 0x24, 0x80, 0, 0x80, 0, 0x55))
+        )
+        self.assertEqual(
+            second.data, bytes((6, 0x41, 0x24, 0xC0, 0, 0xA0, 0, 0x55))
+        )
         self.assertEqual(choose.call_count, 4)
 
     def test_pid24_validates_independent_boundaries_and_round_trips_config(self):
@@ -397,7 +460,9 @@ class EcuSimulatorTests(unittest.TestCase):
 
         response = simulator.handle_request(request)
 
-        self.assertEqual(response.data, bytes((4, 0x41, 2, 0x12, 0x34, 0, 0, 0)))
+        self.assertEqual(
+            response.data, bytes((4, 0x41, 2, 0x12, 0x34, 0x55, 0x55, 0x55))
+        )
         bitmap = int.from_bytes(simulator.supported_bitmap(0), "big")
         self.assertTrue(bitmap & (1 << (32 - 2)))
         self.assertEqual(
@@ -437,9 +502,9 @@ class EcuSimulatorTests(unittest.TestCase):
         status = simulator.handle_request(status_request)
         dtcs = simulator.handle_request(dtc_request)
 
-        self.assertEqual(status.data, bytes((6, 0x41, 1, 0x82, 0, 0, 0, 0)))
+        self.assertEqual(status.data, bytes((6, 0x41, 1, 0x82, 0, 0, 0, 0x55)))
         self.assertEqual(
-            dtcs.data, bytes((5, 0x43, 0x01, 0x33, 0x04, 0x20, 0, 0))
+            dtcs.data, bytes((5, 0x43, 0x01, 0x33, 0x04, 0x20, 0x55, 0x55))
         )
 
     def test_mode04_clears_reported_dtcs_until_the_next_simulation_session(self):
@@ -462,19 +527,21 @@ class EcuSimulatorTests(unittest.TestCase):
         status = simulator.handle_request(status_request)
         dtcs = simulator.handle_request(dtc_request)
 
-        self.assertEqual(clear_response.data, bytes((1, 0x44, 0, 0, 0, 0, 0, 0)))
-        self.assertEqual(status.data, bytes((6, 0x41, 1, 0, 0, 0, 0, 0)))
-        self.assertEqual(dtcs.data, bytes((1, 0x43, 0, 0, 0, 0, 0, 0)))
+        self.assertEqual(
+            clear_response.data, bytes((1, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55))
+        )
+        self.assertEqual(status.data, bytes((6, 0x41, 1, 0, 0, 0, 0, 0x55)))
+        self.assertEqual(dtcs.data, bytes((1, 0x43, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55)))
 
         simulator.start_session()
 
         self.assertEqual(
             simulator.handle_request(status_request).data,
-            bytes((6, 0x41, 1, 0x82, 0, 0, 0, 0)),
+            bytes((6, 0x41, 1, 0x82, 0, 0, 0, 0x55)),
         )
         self.assertEqual(
             simulator.handle_request(dtc_request).data,
-            bytes((5, 0x43, 0x01, 0x33, 0x04, 0x20, 0, 0)),
+            bytes((5, 0x43, 0x01, 0x33, 0x04, 0x20, 0x55, 0x55)),
         )
 
     def test_raw_algorithm_overrides_builtin_pid_bytes(self):

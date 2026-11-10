@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from slcan_protocol import CanFrame
+from slcan_protocol import CAN_PADDING_BYTE, CanFrame
 
 
 PID_DEFINITIONS = {
@@ -511,6 +511,7 @@ def default_config() -> dict:
             for pid in PID_DEFINITIONS
         },
         "dtcs": [dict(dtc) for dtc in DEFAULT_DTC_CONFIG],
+        "multi_pid_response_active": False,
     }
 
 
@@ -872,6 +873,11 @@ def validate_config(config: dict) -> dict:
     mil_on = config.get("mil_on", False)
     if not isinstance(mil_on, bool):
         raise SimulatorConfigError("'mil_on' must be true or false.")
+    multi_pid_response_active = config.get("multi_pid_response_active", False)
+    if not isinstance(multi_pid_response_active, bool):
+        raise SimulatorConfigError(
+            "'multi_pid_response_active' must be true or false."
+        )
 
     return {
         "version": 1,
@@ -880,6 +886,7 @@ def validate_config(config: dict) -> dict:
         "pids": normalized_pids,
         "dtcs": normalized_dtcs,
         "mil_on": mil_on,
+        "multi_pid_response_active": multi_pid_response_active,
     }
 
 
@@ -901,6 +908,7 @@ def save_config(path: Path, config: dict) -> dict:
         "pids": normalized["pids"],
         "dtcs": normalized["dtcs"],
         "mil_on": normalized["mil_on"],
+        "multi_pid_response_active": normalized["multi_pid_response_active"],
     }
     try:
         with path.open("w", encoding="utf-8", newline="\n") as output:
@@ -1092,6 +1100,20 @@ class EcuSimulator:
         return bitmap.to_bytes(4, "big")
 
     def handle_request(self, frame: CanFrame) -> Optional[CanFrame]:
+        response_data = self.handle_request_payload(frame)
+        if response_data is None or len(response_data) > 7:
+            return None
+        frame_data = bytes((len(response_data),)) + response_data
+        frame_data += bytes((CAN_PADDING_BYTE,)) * (8 - len(frame_data))
+        return CanFrame(
+            arbitration_id=self.response_id,
+            extended=False,
+            remote=False,
+            dlc=8,
+            data=frame_data,
+        )
+
+    def handle_request_payload(self, frame: CanFrame) -> Optional[bytes]:
         if (
             frame.extended
             or frame.remote
@@ -1121,27 +1143,26 @@ class EcuSimulator:
             self._dtcs_cleared = True
             response_data = bytes((0x44,))
         elif payload[0] == 0x01 and len(payload) >= 2:
-            pid = payload[1]
-            if pid in PID_BITMAP_PAGES and self.is_supported(pid):
-                data = self.supported_bitmap(pid)
-            elif self.is_supported(pid):
-                _display, data = self.current_value(pid, refresh_random=True)
-            else:
+            requested_pids = payload[1:]
+            if not self.config["multi_pid_response_active"]:
+                requested_pids = requested_pids[:1]
+            pid_data = []
+            seen_pids = set()
+            for pid in requested_pids:
+                if pid in seen_pids or not self.is_supported(pid):
+                    continue
+                seen_pids.add(pid)
+                if pid in PID_BITMAP_PAGES:
+                    data = self.supported_bitmap(pid)
+                else:
+                    _display, data = self.current_value(pid, refresh_random=True)
+                pid_data.append(bytes((pid,)) + data)
+            if not pid_data:
                 return None
-            response_data = bytes((0x41, pid)) + data
+            response_data = bytes((0x41,)) + b"".join(pid_data)
         else:
             return None
-        if len(response_data) > 7:
-            return None
-        frame_data = bytes((len(response_data),)) + response_data
-        frame_data += bytes(8 - len(frame_data))
-        return CanFrame(
-            arbitration_id=self.response_id,
-            extended=False,
-            remote=False,
-            dlc=8,
-            data=frame_data,
-        )
+        return response_data
 
     @staticmethod
     def _encode_dtc(code: str) -> bytes:

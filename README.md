@@ -45,6 +45,14 @@ Select the serial port and its UART baud rate, then connect. Select a CAN
 bitrate and mode and choose **Set bitrate and open CAN**. The bitrate command
 is sent before the CAN open command, as required by the device. Close CAN
 before changing bitrate. Serial baud rate is independent of CAN bitrate.
+The app remembers the last successfully connected serial device and baud rate
+in a per-user settings file and restores them on the next launch.
+
+The main frame table records received and transmitted CAN frames. **Export
+ASC...** saves the current trace in a CANoe-style ASC file with relative host
+timestamps, channel 1, frame direction/type, CAN ID, DLC, and data bytes.
+Device timestamps are retained as comments when present. The export includes
+only frames observed and recorded by this app.
 
 ## Serial debug mode
 
@@ -100,9 +108,19 @@ measurement of total physical bus utilization.
 
 The ECU configuration can be edited in the GUI while disconnected; the
 simulator itself still only runs with CAN open in Normal mode. Start it
-explicitly to answer standard 11-bit single-frame requests. By default it
+explicitly to answer standard 11-bit requests. By default it
 accepts functional requests on `0x7DF` and physical requests on `0x7E0`, and
 replies on `0x7E8`. Unsupported PIDs receive no response.
+
+The **Multi-PID responses** checkbox controls whether a Mode 01 request
+containing multiple PIDs returns all supported requested values (enabled) or
+only the first PID (disabled). It is saved in `ecu_simulator.json` and defaults
+to disabled. A combined response is sent as one ISO-TP payload, segmented into
+single- or multi-frame CAN messages as needed. Multi-frame replies wait for
+tester flow control and honor its block size and separation time; random values
+refresh only for requested PIDs.
+Unused bytes in outgoing OBD and ISO-TP frames are padded with `55` for easier
+trace inspection.
 
 The **Mode 01 PIDs** tab lets you toggle support, edit built-in signal sweeps
 (minimum, maximum, step, and interval), select on-read random values for
@@ -121,8 +139,9 @@ numeric encoders also provide physical ranges and standard byte conversion.
 PID `0x24` offers independent sweep/random bounds for equivalence ratio
 (`0`-`2`) and sensor voltage (`0`-`8 V`).
 Entries needing more than five response bytes are identified as requiring
-multi-frame CAN and are disabled by default because the simulator currently
-sends single frames.
+multi-frame CAN and are disabled by default. Multi-PID replies may use ISO-TP
+multi-frame transport, but configured raw PID values remain limited to five
+bytes.
 The list is based on the [OBD-II PID reference](https://en.wikipedia.org/wiki/OBD-II_PIDs);
 manufacturer-specific or otherwise unlisted PIDs can still be entered manually.
 The simulator responds to Mode 01 data, Mode 03 DTC queries, and Mode 04
@@ -136,10 +155,11 @@ clear-DTC request receives a positive response and suppresses configured DTCs
 and the MIL status for the remainder of that simulator session. Starting a new
 simulator session makes the configured DTCs reportable again.
 
-`ecu_simulator.json` stores request/response CAN IDs, PID definitions,
-algorithms and sweep boundaries, the `mil_on` flag, and DTC descriptions and
-activation flags. **Load JSON...**, **Save config**, and **Open JSON** let you
-use or edit a configuration. JSON does not support comments; use the
+`ecu_simulator.json` stores request/response CAN IDs, the
+`multi_pid_response_active` setting, PID definitions, algorithms and sweep
+boundaries, the `mil_on` flag, and DTC descriptions and activation flags.
+**Load JSON...**, **Save config**, and **Open JSON** let you use or edit a
+configuration. JSON does not support comments; use the
 self-describing field names or the GUI rather than adding comment syntax. For
 example, a custom raw PID and active DTC use these fields:
 
@@ -166,9 +186,10 @@ example, a custom raw PID and active DTC use these fields:
 ```
 
 The example shows the relevant fields only; retain `version`, `request_ids`,
-`response_id`, and the rest of the `pids` object in a complete configuration.
-Multi-frame ISO-TP, other OBD services, and the complete standardized PID
-catalog are not implemented.
+`response_id`, `multi_pid_response_active`, and the rest of the `pids` object
+in a complete configuration. ISO-TP multi-frame support is currently used for
+aggregated Mode 01 replies; other OBD services and the complete standardized
+PID catalog are not implemented.
 
 For reusable context and development guidance when continuing this project
 with an AI assistant, see [the project meta-prompt](./prompts/project_meta_prompt.md).

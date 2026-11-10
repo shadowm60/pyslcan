@@ -28,7 +28,11 @@ observable serial behavior are more important than adding features quickly.
 - `app.py` provides the Tkinter user interface for serial configuration,
   CAN bitrate and mode selection, transmitting frames, displaying received
   and transmitted frames, querying device information, exporting frames as
-  CSV, and hosting the ECU simulator tab.
+  CSV or CANoe-style ASC, and hosting the ECU simulator tab.
+- `app_settings.py` persists the last successfully connected serial device and
+  baud rate in a per-user settings file. `can_trace.py` converts recorded frame
+  rows to an ASC-style trace; preserve observed host timestamps and device
+  timestamps when changing trace recording/export behavior.
 - `serial_worker.py` owns serial I/O in a background thread. It communicates
   with the UI through a thread-safe event queue so serial reads do not block
   the Tkinter event loop.
@@ -42,19 +46,21 @@ observable serial behavior are more important than adding features quickly.
   as a serial device with system Bluetooth tools, then choose its port in the
   app. The app does not set up pairing or RFCOMM on Linux.
 - `ecu_simulator.py` implements ECU simulator JSON configuration and OBD
-  responses. It handles standard 11-bit single-frame Mode 01 PID requests and
-  Mode 03/04 DTC requests. Numeric PIDs support configured sweeps, on-read
-  random values, and fixed raw bytes; compound/status PIDs may remain raw.
+  responses. It handles standard 11-bit Mode 01 PID requests, including
+  optional aggregated multi-PID responses, and Mode 03/04 DTC requests.
+  Numeric PIDs support configured sweeps, on-read random values, and fixed raw
+  bytes; compound/status PIDs may remain raw. `isotp.py` segments aggregated
+  responses and handles tester flow control.
 - `ecu_simulator.json` is the default user-editable ECU profile: it accepts
   functional `0x7DF` and physical `0x7E0` requests and replies on `0x7E8`.
   Its built-in Mode 01 PIDs are enabled by default and it includes sample
   DTCs. `ecu_simulator_dtc.json` is an additional profile with active DTCs.
 - `tests/` contains protocol, serial-worker, Bluetooth-discovery, port
-  selection, and ECU simulator tests. Extend or add targeted tests with
-  behavior changes.
+  selection, app settings, trace export, and ECU simulator tests. Extend or
+  add targeted tests with behavior changes.
 - `README.md` documents Windows/Linux setup, connection flow, device commands,
-  debug behavior, estimated bus load, and the ECU simulator. Update it when
-  user-visible behavior changes.
+  debug behavior, estimated bus load, trace export, startup preferences, and
+  the ECU simulator. Update it when user-visible behavior changes.
 
 ## Custom device protocol
 
@@ -108,6 +114,16 @@ or random bounds, raw bytes, MIL state, and DTC objects. Loading an alternate
 JSON profile changes which file is used for subsequent saves. JSON comments
 are not supported; document configuration with field names and README
 examples, not comment syntax.
+The `multi_pid_response_active` setting, controlled by the **Multi-PID
+responses** checkbox, defaults to false. When enabled, supported Mode 01 PIDs
+from one request are returned in request order; unsupported PIDs are skipped.
+When disabled, only the first requested PID is answered for compatibility.
+Random values are refreshed only for supported PIDs included in the response.
+Combined response payloads use ISO-TP single or multi-frame transmission;
+multi-frame replies wait for tester flow control and honor block size and
+separation time. Unused bytes in outgoing OBD and ISO-TP frames use `0x55`
+padding. Tester flow control for functional requests is expected on the
+configured physical request ID corresponding to the response ID.
 
 The built-in Mode 01 PID set is `01`, `04`, `05`, `0C`, `0D`, `0F`, `11`,
 `1F`, `2F`, `42`, `46`, and `5C`: monitor status, calculated load, coolant
@@ -132,7 +148,7 @@ the raw algorithm unless they have an implemented numeric encoder. The table
 shows current engineering values and response bytes. Double-clicking the
 **Supported** cell toggles support; double-clicking other cells opens the
 editor. PIDs requiring more than five response bytes are disabled by default
-because ISO-TP multi-frame replies are not implemented.
+because individual raw PID configuration is limited to five response bytes.
 
 Supported-PID bitmaps are derived from supported configured PIDs, including
 continuation pages from `0x00` through `0xE0`. PID `0x00` and multiples of
@@ -146,18 +162,19 @@ to three active codes so it fits in the current single-frame response. The
 reports the MIL bit and active-DTC count. A valid Mode 04 request receives a
 positive response and suppresses configured DTCs and MIL status until the next
 explicit simulator session start; it does not modify the saved DTC profile.
-Multi-frame ISO-TP and OBD services other than Mode 01, 03, and 04 are not
-implemented. The add-PID catalog covers standardized Mode 01 PID identifiers,
-but sweep/random behavior is available only for PIDs with an implemented
-numeric encoder and boundaries. Do not infer further protocol behavior than
-the implementation and tests establish.
+Other OBD services beyond Mode 01, 03, and 04 are not implemented. The add-PID
+catalog covers standardized Mode 01 PID identifiers, but sweep/random behavior
+is available only for PIDs with an implemented numeric encoder and boundaries.
+Do not infer further protocol behavior than the implementation and tests
+establish.
 
 When extending the simulator, preserve separation between frame parsing,
-simulation/configuration logic, and Tkinter widgets. Add tests for the exact
-OBD request bytes, response CAN ID, ISO-TP length byte, PID encoding and
-bitmap page continuation, DTC encoding, MIL/count status, unsupported-PID
-behavior, and configuration validation/persistence. Preserve raw CAN logging
-so tester-visible responses can be compared with the table values.
+simulation/configuration logic, ISO-TP transport, and Tkinter widgets. Add
+tests for exact OBD request bytes, response CAN ID, ISO-TP segmentation and
+flow control, PID ordering/encoding and bitmap page continuation, DTC
+encoding, MIL/count status, unsupported-PID behavior, and configuration
+validation/persistence. Preserve raw CAN logging so tester-visible responses
+can be compared with the table values.
 
 Do not silently treat malformed input, a timeout, BEL, or a serial transport
 exception as success. Keep command responses distinguishable from CAN frames
@@ -202,13 +219,14 @@ When diagnosing a disconnect:
 
 ## Likely future extensions
 
-Potential extensions include multi-frame ISO-TP responses, additional OBD-II
-services, DBC-based signal decoding, improved filtering/search, and more
-detailed status flag presentation. The bus-load display is an estimate based
-only on traffic observed by this app; exact physical utilization would require
-adapter/hardware-level support. Implement extensions as separable layers over
-`CanFrame` and keep raw frame logging available so decoding never hides the
-original traffic. Validate protocol semantics against tests and document
-current single-frame limitations.
+Potential extensions include more OBD-II services, DBC-based signal decoding,
+improved filtering/search, and more detailed status flag presentation.
+Multi-PID responses and ISO-TP segmentation are implemented; when changing
+them, keep PID resolution separate from transport framing, preserve request
+ordering, and avoid refreshing unrequested PIDs. Preserve raw CAN logging so
+decoded behavior can be compared with tester-visible traffic. Validate
+protocol semantics against tests and document any remaining limitations. The
+bus-load display is an estimate based only on traffic observed by this app;
+exact physical utilization would require adapter/hardware-level support.
 
 ---

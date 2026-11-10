@@ -19,6 +19,13 @@ from typing import Any, Dict, Optional
 import serial.tools.list_ports
 
 from bluetooth_windows import BluetoothDevice, BluetoothUnavailableError, discover_devices
+from app_settings import (
+    AppSettingsError,
+    load_connection_preferences,
+    save_connection_preferences,
+    settings_path,
+)
+from can_trace import format_asc_trace
 from ecu_simulator import (
     DEFAULT_SWEEPS,
     EcuSimulator,
@@ -32,6 +39,7 @@ from ecu_simulator import (
     load_config,
     save_config,
 )
+from isotp import IsoTpSender
 from serial_worker import SerialWorker
 from slcan_protocol import (
     BITRATES,
@@ -68,6 +76,17 @@ class SlcanApp:
         self.debug_window = None
         self.debug_text = None
         self.last_serial_error = None
+        self.app_settings_path = settings_path()
+        self.preferred_device = None
+        self._pending_connection_preferences = None
+        self._settings_warning = None
+        try:
+            self.preferred_device, preferred_baudrate = load_connection_preferences(
+                self.app_settings_path
+            )
+        except AppSettingsError as exc:
+            preferred_baudrate = "115200"
+            self._settings_warning = str(exc)
         self.simulator_config_path = Path(__file__).with_name("ecu_simulator.json")
         self.simulator_running = False
         self.simulator_response_count = 0
@@ -77,6 +96,11 @@ class SlcanApp:
         self.simulator_response_id_var = tk.StringVar()
         self.simulator_config_path_var = tk.StringVar()
         self.simulator_mil_var = tk.BooleanVar(value=False)
+        self.simulator_multi_pid_var = tk.BooleanVar(value=False)
+        self._simulator_isotp_sender: Optional[IsoTpSender] = None
+        self._simulator_response_command_pending = False
+        self._simulator_flow_control_after = None
+        self._simulator_segment_after = None
         try:
             if self.simulator_config_path.exists():
                 simulator_config = load_config(self.simulator_config_path)
@@ -90,8 +114,8 @@ class SlcanApp:
             self.simulator_config_error = str(exc)
         self.simulator = EcuSimulator(simulator_config)
 
-        self.port_var = tk.StringVar()
-        self.baud_var = tk.StringVar(value="115200")
+        self.port_var = tk.StringVar(value=self.preferred_device or "")
+        self.baud_var = tk.StringVar(value=preferred_baudrate)
         self.bitrate_var = tk.StringVar(value="S6 - 500 kbit/s")
         self.mode_var = tk.StringVar(value="Normal")
         self.status_var = tk.StringVar(value="Disconnected")
@@ -103,6 +127,8 @@ class SlcanApp:
 
         self._build_ui()
         self.refresh_ports()
+        if self._settings_warning:
+            self.status_var.set(self._settings_warning)
         self.root.after(50, self._poll_events)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -266,6 +292,14 @@ class SlcanApp:
 
         frames = ttk.LabelFrame(self.main_tab, text="Received and transmitted frames")
         frames.pack(fill="both", expand=True, padx=8, pady=4)
+        trace_actions = ttk.Frame(frames)
+        trace_actions.pack(anchor="e", fill="x", padx=4, pady=(2, 0))
+        ttk.Button(trace_actions, text="Export ASC...", command=self.export_asc).pack(
+            side="right", padx=3
+        )
+        ttk.Button(trace_actions, text="Export CSV", command=self.export_csv).pack(
+            side="right", padx=3
+        )
         columns = ("time", "direction", "format", "id", "dlc", "data", "timestamp")
         self.frame_table = ttk.Treeview(frames, columns=columns, show="headings", height=12)
         headings = {
@@ -284,9 +318,6 @@ class SlcanApp:
         self.frame_table.configure(yscrollcommand=scrollbar.set)
         self.frame_table.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        ttk.Button(self.main_tab, text="Export CSV", command=self.export_csv).pack(
-            anchor="e", padx=10, pady=(0, 5)
-        )
 
         self._build_simulator_tab()
         status = ttk.Label(self.root, textvariable=self.status_var, anchor="w", relief="sunken")
@@ -332,6 +363,12 @@ class SlcanApp:
             variable=self.simulator_mil_var,
             command=self._save_simulator_config,
         ).grid(row=2, column=0, sticky="w", padx=4, pady=(0, 4))
+        ttk.Checkbutton(
+            controls,
+            text="Multi-PID responses",
+            variable=self.simulator_multi_pid_var,
+            command=self._save_simulator_config,
+        ).grid(row=2, column=1, sticky="w", padx=4, pady=(0, 4))
 
         ttk.Label(
             self.simulator_tab,
@@ -437,6 +474,10 @@ class SlcanApp:
             ", ".join(f"{value:03X}" for value in self.simulator.request_ids)
         )
         self.simulator_response_id_var.set(f"{self.simulator.response_id:03X}")
+        self.simulator_mil_var.set(self.simulator.config["mil_on"])
+        self.simulator_multi_pid_var.set(
+            self.simulator.config["multi_pid_response_active"]
+        )
 
     def _refresh_simulator_table(self) -> None:
         rows = self.simulator.display_rows()
@@ -1067,6 +1108,7 @@ class SlcanApp:
         config["request_ids"] = request_ids
         config["response_id"] = f"0x{response_id:03X}"
         config["mil_on"] = self.simulator_mil_var.get()
+        config["multi_pid_response_active"] = self.simulator_multi_pid_var.get()
         return config
 
     def _save_simulator_config(self) -> None:
@@ -1075,6 +1117,9 @@ class SlcanApp:
             self.simulator.config = save_config(self.simulator_config_path, config)
         except SimulatorConfigError as exc:
             self.simulator_mil_var.set(self.simulator.config["mil_on"])
+            self.simulator_multi_pid_var.set(
+                self.simulator.config["multi_pid_response_active"]
+            )
             messagebox.showerror("Invalid ECU config", str(exc))
             return
         self._refresh_simulator_fields()
@@ -1097,7 +1142,6 @@ class SlcanApp:
         self.simulator_config_path = Path(path)
         self.simulator.update_config(config, reset_clock=True)
         self.simulator_config_path_var.set(str(self.simulator_config_path))
-        self.simulator_mil_var.set(self.simulator.config["mil_on"])
         self._refresh_simulator_fields()
         self._refresh_simulator_table()
         self._refresh_dtc_table()
@@ -1153,6 +1197,7 @@ class SlcanApp:
 
     def _stop_simulator(self) -> None:
         self.simulator_running = False
+        self._clear_simulator_isotp()
         if hasattr(self, "simulator_start_button"):
             self.simulator_start_button.configure(text="Start simulator")
         if hasattr(self, "simulator_status_var"):
@@ -1173,6 +1218,8 @@ class SlcanApp:
             value.split(" - ", 1)[0] for value in self.port_combo["values"]
         }
         self.port_combo["values"] = [labels[port.device] for port in port_infos]
+        if self.preferred_device in ports:
+            self.port_var.set(labels[self.preferred_device])
         added = [port.device for port in port_infos if port.device not in previous]
         bluetooth_added = [
             port for port in added if "bluetooth" in labels[port].casefold()
@@ -1272,6 +1319,7 @@ class SlcanApp:
             return
 
         self.status_var.set(f"Connecting to {port}...")
+        self._pending_connection_preferences = (port, str(baud_rate))
         self.last_serial_error = None
         self.connect_button.configure(state="disabled")
         self.worker = SerialWorker(
@@ -1486,8 +1534,10 @@ class SlcanApp:
             for button in self._command_buttons:
                 button.configure(state="normal")
             self.status_var.set("Serial connected; CAN is closed.")
+            self._save_connection_preferences_after_connect()
         elif event_type == "disconnected":
             self.connected = False
+            self._pending_connection_preferences = None
             self.can_open = False
             self._stop_bus_load_measurement()
             self._stop_simulator()
@@ -1529,27 +1579,136 @@ class SlcanApp:
             return
         try:
             request = parse_frame(line)
-            response = self.simulator.handle_request(request)
         except ValueError as exc:
             self.simulator_status_var.set(f"Could not parse OBD request: {exc}")
             return
-        if response is None:
+
+        sender = self._simulator_isotp_sender
+        if sender is not None:
+            if sender.accept_flow_control(request):
+                self._cancel_simulator_flow_control_timeout()
+                if sender.error:
+                    self._clear_simulator_isotp()
+                    self.simulator_status_var.set(
+                        f"ISO-TP response stopped: {sender.error}"
+                    )
+                else:
+                    self._continue_simulator_isotp()
+                return
+            if not sender.complete or self._simulator_response_command_pending:
+                return
+            self._clear_simulator_isotp()
+
+        response_data = self.simulator.handle_request_payload(request)
+        if response_data is None:
             return
-        command = encode_frame(response)
+        self.simulator_response_count += 1
         if self.worker is None:
             self._stop_simulator()
             return
-        self.worker.send(command, "ecu_response")
-        service = request.data[1]
+
+        flow_control_id = self._simulator_flow_control_id(request.arbitration_id)
+        sender = IsoTpSender(
+            self.simulator.response_id, flow_control_id, response_data
+        )
+        response_frame = sender.initial_frame()
+        if not sender.complete:
+            self._simulator_isotp_sender = sender
+        self._send_simulator_response(response_frame)
+
+        service = response_data[0]
         if service == 0x03:
             message = "OBD Mode 03 DTC request received; replying..."
         elif service == 0x04:
             message = "OBD Mode 04 clear-DTC request received; replying..."
+        elif (request.data[0] & 0x0F) > 2 and response_data[0] == 0x41:
+            pid_count = (request.data[0] & 0x0F) - 1
+            requested = ", ".join(
+                f"0x{pid:02X}" for pid in request.data[2 : 2 + pid_count]
+            )
+            message = f"OBD multi-PID request ({requested}) received; replying..."
         else:
             message = (
-                f"OBD Mode 01 PID 0x{request.data[2]:02X} request received; replying..."
+                f"OBD Mode 01 PID 0x{response_data[1]:02X} request received; replying..."
             )
         self.simulator_status_var.set(message)
+
+    def _simulator_flow_control_id(self, request_id: int) -> int:
+        if request_id != 0x7DF:
+            return request_id
+        expected_id = self.simulator.response_id - 8
+        physical_ids = [
+            can_id for can_id in self.simulator.request_ids if can_id != 0x7DF
+        ]
+        if expected_id in physical_ids:
+            return expected_id
+        return physical_ids[0] if physical_ids else request_id
+
+    def _send_simulator_response(self, frame: CanFrame) -> None:
+        if self.worker is None:
+            self._stop_simulator()
+            return
+        if self._simulator_isotp_sender is not None:
+            self._simulator_response_command_pending = True
+        self.worker.send(encode_frame(frame), "ecu_response")
+
+    def _continue_simulator_isotp(self) -> None:
+        sender = self._simulator_isotp_sender
+        if sender is None or self._simulator_response_command_pending:
+            return
+        if sender.error:
+            self._clear_simulator_isotp()
+            self.simulator_status_var.set(f"ISO-TP response stopped: {sender.error}")
+        elif sender.complete:
+            self._clear_simulator_isotp()
+            self.simulator_status_var.set(
+                f"Running; sent {self.simulator_response_count} OBD response(s)."
+            )
+        elif sender.waiting_for_flow_control:
+            self._start_simulator_flow_control_timeout()
+        elif self._simulator_segment_after is None:
+            self._simulator_segment_after = self.root.after(
+                sender.st_min_ms, self._send_next_simulator_segment
+            )
+
+    def _send_next_simulator_segment(self) -> None:
+        self._simulator_segment_after = None
+        sender = self._simulator_isotp_sender
+        if sender is None or self._simulator_response_command_pending:
+            return
+        frame = sender.next_frame()
+        if frame is None:
+            self._continue_simulator_isotp()
+            return
+        self._send_simulator_response(frame)
+
+    def _start_simulator_flow_control_timeout(self) -> None:
+        self._cancel_simulator_flow_control_timeout()
+        self._simulator_flow_control_after = self.root.after(
+            1000, self._simulator_flow_control_timed_out
+        )
+
+    def _cancel_simulator_flow_control_timeout(self) -> None:
+        if self._simulator_flow_control_after is not None:
+            self.root.after_cancel(self._simulator_flow_control_after)
+            self._simulator_flow_control_after = None
+
+    def _simulator_flow_control_timed_out(self) -> None:
+        self._simulator_flow_control_after = None
+        sender = self._simulator_isotp_sender
+        if sender is not None and sender.waiting_for_flow_control:
+            self._clear_simulator_isotp()
+            self.simulator_status_var.set(
+                "ISO-TP response stopped: timed out waiting for tester flow control."
+            )
+
+    def _clear_simulator_isotp(self) -> None:
+        self._cancel_simulator_flow_control_timeout()
+        if self._simulator_segment_after is not None:
+            self.root.after_cancel(self._simulator_segment_after)
+            self._simulator_segment_after = None
+        self._simulator_isotp_sender = None
+        self._simulator_response_command_pending = False
 
     def _command_completed(self, event: Dict[str, Any]) -> None:
         tag = event["tag"]
@@ -1562,6 +1721,7 @@ class SlcanApp:
                 return
             self.status_var.set(f"Command failed: {response}")
             if tag == "ecu_response":
+                self._clear_simulator_isotp()
                 self.simulator_status_var.set(
                     f"OBD response failed: {response}"
                 )
@@ -1601,11 +1761,14 @@ class SlcanApp:
             self.status_var.set(f"Transmit accepted. {response}".strip())
             self._add_frame(event["command"], "TX")
         elif tag == "ecu_response":
-            self.simulator_response_count += 1
             self._add_frame(event["command"], "TX")
-            self.simulator_status_var.set(
-                f"Running; sent {self.simulator_response_count} OBD response(s)."
-            )
+            if self._simulator_isotp_sender is not None:
+                self._simulator_response_command_pending = False
+                self._continue_simulator_isotp()
+            else:
+                self.simulator_status_var.set(
+                    f"Running; sent {self.simulator_response_count} OBD response(s)."
+                )
         elif tag == "timestamp_on":
             self.status_var.set("Receive timestamps enabled.")
         elif tag == "timestamp_off":
@@ -1666,6 +1829,39 @@ class SlcanApp:
             messagebox.showerror("Export failed", str(exc))
             return
         self.status_var.set(f"Exported {len(self._records)} frames to {path}")
+
+    def export_asc(self) -> None:
+        if not self._records:
+            messagebox.showinfo("No frames", "There are no frames to export yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export CANoe ASC trace",
+            defaultextension=".asc",
+            filetypes=(("CANoe ASC files", "*.asc"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            trace = format_asc_trace(self._records)
+            with open(path, "w", encoding="utf-8", newline="\n") as output:
+                output.write(trace)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("ASC export failed", str(exc))
+            return
+        self.status_var.set(f"Exported {len(self._records)} frames to {path}")
+
+    def _save_connection_preferences_after_connect(self) -> None:
+        preferences = self._pending_connection_preferences
+        self._pending_connection_preferences = None
+        if preferences is None:
+            return
+        device, baudrate = preferences
+        try:
+            save_connection_preferences(self.app_settings_path, device, baudrate)
+        except AppSettingsError as exc:
+            self.status_var.set(f"Connected, but could not save startup settings: {exc}")
+            return
+        self.preferred_device = device
 
     def _frame_type_changed(self, _event: Any = None) -> None:
         remote = self.frame_type_var.get().endswith("remote")

@@ -16,6 +16,8 @@ BITRATES = {
     "S8": 1_000_000,
 }
 
+CAN_PADDING_BYTE = 0x55
+
 
 @dataclass(frozen=True)
 class CanFrame:
