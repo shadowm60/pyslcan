@@ -1617,20 +1617,22 @@ class SlcanApp:
         self._send_simulator_response(response_frame)
 
         service = response_data[0]
-        if service == 0x03:
+        if service == 0x43:
             message = "OBD Mode 03 DTC request received; replying..."
-        elif service == 0x04:
+        elif service == 0x44:
             message = "OBD Mode 04 clear-DTC request received; replying..."
-        elif (request.data[0] & 0x0F) > 2 and response_data[0] == 0x41:
+        elif service == 0x41 and (request.data[0] & 0x0F) > 2:
             pid_count = (request.data[0] & 0x0F) - 1
             requested = ", ".join(
                 f"0x{pid:02X}" for pid in request.data[2 : 2 + pid_count]
             )
             message = f"OBD multi-PID request ({requested}) received; replying..."
-        else:
+        elif service == 0x41 and len(response_data) > 1:
             message = (
                 f"OBD Mode 01 PID 0x{response_data[1]:02X} request received; replying..."
             )
+        else:
+            message = f"OBD response 0x{service:02X} sent."
         self.simulator_status_var.set(message)
 
     def _simulator_flow_control_id(self, request_id: int) -> int:

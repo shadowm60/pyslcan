@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from app import SlcanApp
 from ecu_simulator import EcuSimulator, default_config
-from slcan_protocol import CanFrame, encode_frame
+from slcan_protocol import CanFrame, encode_frame, parse_frame
 
 
 class FakeCombo:
@@ -63,6 +63,24 @@ class FakeWorker:
 
 
 class AppPortTests(unittest.TestCase):
+    def make_simulator_app(self, config=None):
+        app = SlcanApp.__new__(SlcanApp)
+        app.simulator = EcuSimulator(config or default_config(), clock=lambda: 100.0)
+        app.simulator_running = True
+        app.can_open = True
+        app.mode_var = FakeVariable("Normal")
+        app.connected = True
+        app.worker = FakeWorker()
+        app.root = FakeRoot()
+        app.simulator_status_var = FakeVariable()
+        app.simulator_response_count = 0
+        app._simulator_isotp_sender = None
+        app._simulator_response_command_pending = False
+        app._simulator_flow_control_after = None
+        app._simulator_segment_after = None
+        app._add_frame = lambda *_args: None
+        return app
+
     def test_bus_load_is_a_rolling_ten_second_estimate(self):
         app = SlcanApp.__new__(SlcanApp)
         app.bus_load_var = FakeVariable()
@@ -156,21 +174,7 @@ class AppPortTests(unittest.TestCase):
     def test_multi_pid_response_waits_for_flow_control_and_sends_segments(self):
         config = default_config()
         config["multi_pid_response_active"] = True
-        app = SlcanApp.__new__(SlcanApp)
-        app.simulator = EcuSimulator(config, clock=lambda: 100.0)
-        app.simulator_running = True
-        app.can_open = True
-        app.mode_var = FakeVariable("Normal")
-        app.connected = True
-        app.worker = FakeWorker()
-        app.root = FakeRoot()
-        app.simulator_status_var = FakeVariable()
-        app.simulator_response_count = 0
-        app._simulator_isotp_sender = None
-        app._simulator_response_command_pending = False
-        app._simulator_flow_control_after = None
-        app._simulator_segment_after = None
-        app._add_frame = lambda *_args: None
+        app = self.make_simulator_app(config)
         request = CanFrame(
             0x7DF, False, False, 8, bytes((3, 1, 0x01, 0x0C, 0, 0, 0, 0))
         )
@@ -218,21 +222,7 @@ class AppPortTests(unittest.TestCase):
     def test_small_multi_pid_response_is_returned_as_single_frame(self):
         config = default_config()
         config["multi_pid_response_active"] = True
-        app = SlcanApp.__new__(SlcanApp)
-        app.simulator = EcuSimulator(config, clock=lambda: 100.0)
-        app.simulator_running = True
-        app.can_open = True
-        app.mode_var = FakeVariable("Normal")
-        app.connected = True
-        app.worker = FakeWorker()
-        app.root = FakeRoot()
-        app.simulator_status_var = FakeVariable()
-        app.simulator_response_count = 0
-        app._simulator_isotp_sender = None
-        app._simulator_response_command_pending = False
-        app._simulator_flow_control_after = None
-        app._simulator_segment_after = None
-        app._add_frame = lambda *_args: None
+        app = self.make_simulator_app(config)
         request = CanFrame(
             0x7DF, False, False, 8, bytes((3, 1, 0x0C, 0x0D, 0, 0, 0, 0))
         )
@@ -242,6 +232,29 @@ class AppPortTests(unittest.TestCase):
         self.assertEqual(len(app.worker.commands), 1)
         response = app.worker.commands[0][0]
         self.assertTrue(response.startswith("t7E8806410C0C800D0055"))
+
+    def test_mode04_response_updates_status_without_indexing_missing_pid(self):
+        app = self.make_simulator_app()
+        request = CanFrame(0x7DF, False, False, 8, bytes((1, 4, 0, 0, 0, 0, 0, 0)))
+
+        app._handle_simulator_request(encode_frame(request))
+
+        self.assertEqual(len(app.worker.commands), 1)
+        response = parse_frame(app.worker.commands[0][0])
+        self.assertEqual(
+            response.data,
+            bytes((1, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55)),
+        )
+        self.assertIn("Mode 04", app.simulator_status_var.get())
+
+    def test_mode03_response_updates_status_with_positive_service(self):
+        app = self.make_simulator_app()
+        request = CanFrame(0x7DF, False, False, 8, bytes((1, 3, 0, 0, 0, 0, 0, 0)))
+
+        app._handle_simulator_request(encode_frame(request))
+
+        self.assertEqual(len(app.worker.commands), 1)
+        self.assertIn("Mode 03", app.simulator_status_var.get())
 
     def test_connect_bluetooth_explains_linux_setup_without_windows_settings(self):
         app = SlcanApp.__new__(SlcanApp)
