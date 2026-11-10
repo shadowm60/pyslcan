@@ -33,16 +33,18 @@ observable serial behavior are more important than adding features quickly.
   with the UI through a thread-safe event queue so serial reads do not block
   the Tkinter event loop.
 - `slcan_protocol.py` defines the `CanFrame` model, bitrate table, frame
-  encoder, and frame parser. Keep protocol logic independent of Tk widgets so
-  future DBC or OBD-II decoding can use the same frame model.
+  encoder, frame parser, and approximate Classical CAN wire-bit estimator.
+  Keep protocol logic independent of Tk widgets so future DBC or OBD-II
+  decoding can use the same frame model.
 - `bluetooth_windows.py` discovers Windows Bluetooth Classic devices for SPP.
   Windows handles pairing/connection; the resulting virtual COM port is then
   opened through pySerial. On Linux, pair/connect and configure the SPP service
   as a serial device with system Bluetooth tools, then choose its port in the
   app. The app does not set up pairing or RFCOMM on Linux.
 - `ecu_simulator.py` implements ECU simulator JSON configuration and OBD
-  responses. It handles standard 11-bit single-frame Mode 01 and Mode 03
-  requests, with configurable numeric sweeps and fixed raw-byte PID values.
+  responses. It handles standard 11-bit single-frame Mode 01 PID requests and
+  Mode 03/04 DTC requests. Numeric PIDs support configured sweeps, on-read
+  random values, and fixed raw bytes; compound/status PIDs may remain raw.
 - `ecu_simulator.json` is the default user-editable ECU profile: it accepts
   functional `0x7DF` and physical `0x7E0` requests and replies on `0x7E8`.
   Its built-in Mode 01 PIDs are enabled by default and it includes sample
@@ -51,7 +53,8 @@ observable serial behavior are more important than adding features quickly.
   selection, and ECU simulator tests. Extend or add targeted tests with
   behavior changes.
 - `README.md` documents Windows/Linux setup, connection flow, device commands,
-  and debug behavior. Update it when user-visible behavior changes.
+  debug behavior, estimated bus load, and the ECU simulator. Update it when
+  user-visible behavior changes.
 
 ## Custom device protocol
 
@@ -80,6 +83,12 @@ CAN frames use hexadecimal fields:
 - Received lines may have an optional four-hex-digit timestamp appended before
   CR.
 
+The SLCAN monitor reports an estimated rolling 10-second CAN utilization using
+the selected bitrate and received/acknowledged TX frames visible to the app.
+The estimator includes frame overhead and approximate bit stuffing. It does
+not know about adapter-filtered or otherwise unseen traffic, so it is an
+estimate of observed frames, not a measurement of total physical bus load.
+
 ## ECU simulator behavior
 
 The ECU configuration tab remains available while disconnected. Configuration
@@ -95,7 +104,7 @@ The default `ecu_simulator.json` profile uses these 11-bit CAN IDs:
 
 The request/response IDs are editable in the tab and persisted to the JSON
 profile. The profile defines supported flags, PID algorithms, numeric sweep
-configuration, raw bytes, MIL state, and DTC objects. Loading an alternate
+or random bounds, raw bytes, MIL state, and DTC objects. Loading an alternate
 JSON profile changes which file is used for subsequent saves. JSON comments
 are not supported; document configuration with field names and README
 examples, not comment syntax.
@@ -105,12 +114,25 @@ The built-in Mode 01 PID set is `01`, `04`, `05`, `0C`, `0D`, `0F`, `11`,
 temperature, RPM, vehicle speed, intake temperature, throttle, runtime, fuel
 level, control module voltage, ambient temperature, and oil temperature.
 Numeric built-ins use per-PID minimum, maximum, step, and interval fields for
-triangular sweeps. In the **Mode 01 PIDs** GUI tab, users can toggle support,
-edit sweep boundaries, switch built-in PIDs to fixed raw bytes, and add or
-remove custom PIDs. A custom PID needs a name, unit, supported flag, and one
-to five raw bytes; custom PIDs use the raw algorithm. The table shows current
-engineering values and response bytes. Double-clicking the **Supported**
-cell toggles support; double-clicking other cells opens the editor.
+triangular sweeps. Supported numeric PIDs can use `sweep`, `random`, or `raw`
+algorithms. Sweep values advance on a time interval; random values are
+generated only when that PID is requested, not by a timer or table refresh.
+Standard PID encoders convert engineering values into response bytes.
+Compound/status PIDs without a single numeric range remain raw unless a
+specific composite encoding is implemented. PID `0x24` is implemented as a
+composite numeric PID with independent equivalence-ratio (`0`-`2`) and sensor
+voltage (`0`-`8 V`) bounds, separate sweep steps, and the corresponding
+four-byte encoding.
+
+In the **Mode 01 PIDs** GUI tab, users can toggle support, configure an
+algorithm and its boundaries, and add or remove custom PIDs. The standard
+Mode 01 catalog pre-fills names and raw response defaults. A custom/vendor PID
+needs a name, unit, supported flag, and one to five raw bytes; custom PIDs use
+the raw algorithm unless they have an implemented numeric encoder. The table
+shows current engineering values and response bytes. Double-clicking the
+**Supported** cell toggles support; double-clicking other cells opens the
+editor. PIDs requiring more than five response bytes are disabled by default
+because ISO-TP multi-frame replies are not implemented.
 
 Supported-PID bitmaps are derived from supported configured PIDs, including
 continuation pages from `0x00` through `0xE0`. PID `0x00` and multiples of
@@ -121,10 +143,14 @@ The **Active DTCs (Mode 03)** GUI tab allows adding, editing, removing, and
 activating configured DTCs. Mode 03 responds with the active DTC list, limited
 to three active codes so it fits in the current single-frame response. The
 `mil_on` configuration flag is independent of DTC activation. PID `0x01`
-reports the MIL bit and active-DTC count. Mode 04 clearing, multi-frame
-ISO-TP, other OBD services, and the complete standardized PID catalog are not
-implemented. Do not infer more protocol behavior than the implementation and
-tests establish.
+reports the MIL bit and active-DTC count. A valid Mode 04 request receives a
+positive response and suppresses configured DTCs and MIL status until the next
+explicit simulator session start; it does not modify the saved DTC profile.
+Multi-frame ISO-TP and OBD services other than Mode 01, 03, and 04 are not
+implemented. The add-PID catalog covers standardized Mode 01 PID identifiers,
+but sweep/random behavior is available only for PIDs with an implemented
+numeric encoder and boundaries. Do not infer further protocol behavior than
+the implementation and tests establish.
 
 When extending the simulator, preserve separation between frame parsing,
 simulation/configuration logic, and Tkinter widgets. Add tests for the exact
@@ -176,11 +202,13 @@ When diagnosing a disconnect:
 
 ## Likely future extensions
 
-Potential extensions include Mode 04 DTC clearing, additional OBD-II services
-and standardized PIDs, DBC-based signal decoding, better filtering/search,
-and more detailed status flag presentation. Implement these as separable
-layers over `CanFrame` and keep raw frame logging available so decoding never
-hides the original traffic. Validate protocol semantics against tests and
-document current single-frame limitations.
+Potential extensions include multi-frame ISO-TP responses, additional OBD-II
+services, DBC-based signal decoding, improved filtering/search, and more
+detailed status flag presentation. The bus-load display is an estimate based
+only on traffic observed by this app; exact physical utilization would require
+adapter/hardware-level support. Implement extensions as separable layers over
+`CanFrame` and keep raw frame logging available so decoding never hides the
+original traffic. Validate protocol semantics against tests and document
+current single-frame limitations.
 
 ---
