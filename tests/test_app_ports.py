@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import cantools
+
 from app import SlcanApp
 from ecu_simulator import EcuSimulator, default_config
 from slcan_protocol import CanFrame, encode_frame, parse_frame
@@ -60,6 +62,28 @@ class FakeWorker:
 
     def send(self, command, tag):
         self.commands.append((command, tag))
+
+
+class FakeTree:
+    def __init__(self):
+        self.rows = {}
+        self.selected = ()
+
+    def selection(self):
+        return self.selected
+
+    def selection_set(self, keys):
+        self.selected = tuple(keys)
+
+    def exists(self, key):
+        return key in self.rows
+
+    def item(self, key, option=None, **kwargs):
+        if "values" in kwargs:
+            self.rows[key] = kwargs["values"]
+        if option == "values":
+            return self.rows[key]
+        return {"values": self.rows[key]}
 
 
 class AppPortTests(unittest.TestCase):
@@ -122,6 +146,103 @@ class AppPortTests(unittest.TestCase):
             app.port_var.get(), "COM7 - Standard Serial over Bluetooth link"
         )
         self.assertIn("COM7", app.status_var.get())
+
+    def test_dbc_profile_serializes_selection_and_running_state_independently(self):
+        database = cantools.database.load_string(
+            """
+            VERSION ""
+            NS_ :
+            BS_:
+            BU_: ECU
+            BO_ 1 First: 1 ECU
+            BO_ 2 Second: 1 ECU
+            """
+        )
+        app = SlcanApp.__new__(SlcanApp)
+        app.dbc_database = database
+        app.dbc_messages = {
+            "0": database.get_message_by_name("First"),
+            "1": database.get_message_by_name("Second"),
+        }
+        app.dbc_message_table = FakeTree()
+        app.dbc_message_table.selected = ("1",)
+        app.dbc_cycle_overrides = {}
+        app.dbc_signal_settings = {}
+        app.dbc_path_var = FakeVariable("/tmp/example.dbc")
+        app._dbc_next_tx = {"0": 1.0}
+        app._dbc_profile_start_keys = {"1"}
+
+        profile = app._serialize_dbc_profile()
+
+        self.assertEqual(
+            profile["messages"],
+            [
+                {"frame_id": 1, "message": "First", "selected": False, "running": True},
+                {"frame_id": 2, "message": "Second", "selected": True, "running": True},
+            ],
+        )
+
+    def test_dbc_profile_restores_selection_and_armed_state_without_transmitting(self):
+        database = cantools.database.load_string(
+            """
+            VERSION ""
+            NS_ :
+            BS_:
+            BU_: ECU
+            BO_ 1 First: 1 ECU
+            BO_ 2 Second: 1 ECU
+            """
+        )
+        app = SlcanApp.__new__(SlcanApp)
+        app._populate_dbc_database = lambda _path, loaded: self._populate_fake_dbc(
+            app, loaded
+        )
+        app._show_dbc_signals = lambda: None
+        app._update_dbc_availability = lambda: None
+
+        app._apply_dbc_profile(
+            {
+                "messages": [
+                    {"frame_id": 1, "message": "First", "selected": False, "running": True},
+                    {"frame_id": 2, "message": "Second", "selected": True, "running": False},
+                ],
+                "cycle_overrides": [],
+                "signals": [],
+            },
+            "/tmp/example.dbc",
+            database,
+        )
+
+        self.assertEqual(app.dbc_message_table.selection(), ("1",))
+        self.assertEqual(app._dbc_profile_start_keys, {"0"})
+        self.assertEqual(app._dbc_next_tx, {})
+        self.assertEqual(app.dbc_message_table.rows["0"][-1], "Ready")
+
+    @staticmethod
+    def _populate_fake_dbc(app, database):
+        app.dbc_database = database
+        messages = sorted(
+            database.messages, key=lambda message: (message.frame_id, message.name)
+        )
+        app.dbc_messages = {
+            str(index): message for index, message in enumerate(messages)
+        }
+        app.dbc_cycle_overrides = {}
+        app.dbc_signal_settings = {}
+        app._dbc_profile_start_keys = set()
+        app._dbc_next_tx = {}
+        app._dbc_pending = set()
+        app.dbc_message_table = FakeTree()
+        for key, message in app.dbc_messages.items():
+            app.dbc_message_table.rows[key] = (
+                f"{message.frame_id:03X}",
+                message.name,
+                message.length,
+                "--",
+                "",
+                "100 (fallback)",
+                "Stopped",
+            )
 
     def test_refresh_ports_selects_the_remembered_device_when_available(self):
         app = SlcanApp.__new__(SlcanApp)

@@ -28,7 +28,8 @@ observable serial behavior are more important than adding features quickly.
 - `app.py` provides the Tkinter user interface for serial configuration,
   CAN bitrate and mode selection, transmitting frames, displaying received
   and transmitted frames, querying device information, exporting frames as
-  CSV or CANoe-style ASC, and hosting the ECU simulator tab.
+  CSV or CANoe-style ASC, and hosting the ECU simulator and DBC transmitter
+  tabs.
 - `app_settings.py` persists the last successfully connected serial device and
   baud rate in a per-user settings file. `can_trace.py` converts recorded frame
   rows to an ASC-style trace; preserve observed host timestamps and device
@@ -55,12 +56,20 @@ observable serial behavior are more important than adding features quickly.
   functional `0x7DF` and physical `0x7E0` requests and replies on `0x7E8`.
   Its built-in Mode 01 PIDs are enabled by default and it includes sample
   DTCs. `ecu_simulator_dtc.json` is an additional profile with active DTCs.
+- `dbc_transmitter.py` loads DBC databases and encodes messages with static,
+  bouncing-sweep, or random signal values. `dbc_profiles.py` persists multiple
+  named transmitter configurations in the per-user settings directory.
+  `app.py` owns the DBC table, cycle-time editor, per-message controls, and
+  scheduling lifecycle. The bundled `dbc/` directory contains sample DBC
+  data.
 - `tests/` contains protocol, serial-worker, Bluetooth-discovery, port
-  selection, app settings, trace export, and ECU simulator tests. Extend or
-  add targeted tests with behavior changes.
+  selection, app settings, trace export, ECU simulator, DBC transmitter,
+  profile, and serial-worker regression tests. Extend or add targeted tests
+  with behavior changes.
 - `README.md` documents Windows/Linux setup, connection flow, device commands,
   debug behavior, estimated bus load, trace export, startup preferences, and
-  the ECU simulator. Update it when user-visible behavior changes.
+  the ECU simulator and DBC transmitter. Update it when user-visible behavior
+  changes.
 
 ## Custom device protocol
 
@@ -94,6 +103,42 @@ the selected bitrate and received/acknowledged TX frames visible to the app.
 The estimator includes frame overhead and approximate bit stuffing. It does
 not know about adapter-filtered or otherwise unseen traffic, so it is an
 estimate of observed frames, not a measurement of total physical bus load.
+
+## DBC cyclic transmitter
+
+The DBC transmitter is for transmitting Classical CAN messages described by a
+loaded DBC; it does not decode received frames. The table shows DBC cycle time,
+an optional per-message override, effective cycle time, and run state.
+Effective cycle selection is override first, DBC cycle time second, then a
+100 ms fallback when the DBC defines no cycle. Cycle values are milliseconds.
+Cycle-time cells are editable by double-clicking the DBC cycle, Override, or
+Effective column.
+
+Messages can be selected independently of whether they are running. Multiple
+messages may run concurrently, each on its own cycle. A profile stores
+selection and running state separately, along with the DBC path, cycle
+overrides, and per-signal generator settings. Loading a profile (including
+startup restoration of the last profile) must never start transmission
+automatically. Previously running messages are restored as ready-to-resume;
+the user must open CAN in Normal mode and explicitly choose **Start saved**.
+Preserve compatibility with older profiles that contain message identities
+without selection/running fields.
+
+Signal modes are fixed physical value (`raw`), bouncing sweep, and random
+physical value. Sweeps reverse direction at the configured endpoints. Use DBC
+minimum/maximum when present; when missing, use the representable physical
+range for the signal's bit length and scale. The default sweep step is the
+signal scale; DBC does not define a separate step. Values and generator bounds
+must be validated against the signal's representable/DBC bounds. SLCAN
+transmission is limited to 8 data bytes per frame.
+
+The UI scheduler sends due messages through `serial_worker.py`; serial
+commands are serialized by the worker and each transmit waits for the device
+acknowledgment. Requested cycle times are not guaranteed when the serial
+adapter cannot complete commands quickly enough. Keep serial reads
+nonblocking while idle so an empty receive poll does not add avoidable latency
+before the next queued command. Do not claim a throughput limit or hardware
+performance result without measuring it on the target device.
 
 ## ECU simulator behavior
 
@@ -203,6 +248,9 @@ When diagnosing a disconnect:
 ## Development and validation
 
 - Keep serial I/O and Bluetooth discovery off the Tkinter UI thread.
+- Keep DBC frame encoding and scheduling responsive: route sends through the
+  serial worker, avoid blocking the Tkinter event loop, and retain per-message
+  start/stop state and pending-command safeguards.
 - Tkinter modal editor windows must be mapped before setting a grab: call
   `wait_visibility()` before `grab_set()` for newly created `Toplevel`s. Apply
   this to PID and DTC dialogs to avoid `TclError: grab failed: window not
@@ -210,17 +258,19 @@ When diagnosing a disconnect:
 - Use only the dependencies already declared in `requirements.txt` unless a
   new dependency is necessary.
 - Run the narrowest relevant tests, then the full test suite when practical:
-  `python -m unittest discover -s tests -v` (use `python3` if needed).
+  `python -m unittest discover -s tests -v` (use `python3` or the project
+  virtual environment if needed).
 - Check syntax/imports with:
-  `python -m py_compile app.py bluetooth_windows.py ecu_simulator.py serial_worker.py slcan_protocol.py`
+  `python -m py_compile app.py bluetooth_windows.py dbc_profiles.py dbc_transmitter.py ecu_simulator.py serial_worker.py slcan_protocol.py`
   (use `python3` if needed).
 - Summarize changed files, validation results, and any remaining hardware
   verification needed.
 
 ## Likely future extensions
 
-Potential extensions include more OBD-II services, DBC-based signal decoding,
-improved filtering/search, and more detailed status flag presentation.
+Potential extensions include more OBD-II services, DBC-based decoding of
+received frames, improved filtering/search, and more detailed status flag
+presentation.
 Multi-PID responses and ISO-TP segmentation are implemented; when changing
 them, keep PID resolution separate from transport framing, preserve request
 ordering, and avoid refreshing unrequested PIDs. Preserve raw CAN logging so

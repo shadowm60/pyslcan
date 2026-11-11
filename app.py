@@ -3,6 +3,7 @@
 import csv
 import copy
 import ctypes
+import math
 import os
 import queue
 import subprocess
@@ -13,10 +14,12 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from typing import Any, Dict, Optional
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
+import cantools
 import serial.tools.list_ports
+from cantools.database.can import Message
 
 from bluetooth_windows import BluetoothDevice, BluetoothUnavailableError, discover_devices
 from app_settings import (
@@ -26,6 +29,14 @@ from app_settings import (
     settings_path,
 )
 from can_trace import format_asc_trace
+from dbc_profiles import DbcProfilesError, load_profiles, save_profiles
+from dbc_transmitter import (
+    SignalTxSettings,
+    default_signal_settings,
+    encode_message,
+    load_dbc,
+    signal_value_bounds,
+)
 from ecu_simulator import (
     DEFAULT_SWEEPS,
     EcuSimulator,
@@ -101,6 +112,25 @@ class SlcanApp:
         self._simulator_response_command_pending = False
         self._simulator_flow_control_after = None
         self._simulator_segment_after = None
+        self.dbc_database: Optional[cantools.database.Database] = None
+        self.dbc_messages: Dict[str, Message] = {}
+        self.dbc_signal_settings: Dict[Tuple[str, str], SignalTxSettings] = {}
+        self.dbc_cycle_overrides: Dict[str, float] = {}
+        self.dbc_path_var = tk.StringVar(value="No DBC loaded")
+        self.dbc_status_var = tk.StringVar(value="Load a DBC file to configure cyclic messages.")
+        self.dbc_running = False
+        self._dbc_after = None
+        self._dbc_next_tx: Dict[str, float] = {}
+        self._dbc_periods: Dict[str, float] = {}
+        self._dbc_pending: Set[str] = set()
+        self._dbc_sweep_values: Dict[str, Dict[str, float]] = {}
+        self._dbc_sweep_directions: Dict[str, Dict[str, int]] = {}
+        self._dbc_profile_start_keys: Set[str] = set()
+        self.dbc_load_button: Optional[ttk.Button] = None
+        self.dbc_start_saved_button: Optional[ttk.Button] = None
+        self.dbc_profiles_path = self.app_settings_path.parent / "dbc_profiles.json"
+        self.dbc_profiles: Dict[str, Any] = {"last_profile": None, "profiles": {}}
+        self.dbc_profile_var = tk.StringVar()
         try:
             if self.simulator_config_path.exists():
                 simulator_config = load_config(self.simulator_config_path)
@@ -126,6 +156,7 @@ class SlcanApp:
         self.bluetooth_var = tk.StringVar()
 
         self._build_ui()
+        self._restore_last_dbc_profile()
         self.refresh_ports()
         if self._settings_warning:
             self.status_var.set(self._settings_warning)
@@ -136,8 +167,10 @@ class SlcanApp:
         self.notebook = ttk.Notebook(self.root)
         self.main_tab = ttk.Frame(self.notebook)
         self.simulator_tab = ttk.Frame(self.notebook)
+        self.dbc_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.main_tab, text="SLCAN monitor")
         self.notebook.add(self.simulator_tab, text="ECU simulator")
+        self.notebook.add(self.dbc_tab, text="DBC transmitter")
         self.notebook.pack(fill="both", expand=True)
 
         if sys.platform == "win32":
@@ -320,8 +353,994 @@ class SlcanApp:
         scrollbar.pack(side="right", fill="y")
 
         self._build_simulator_tab()
+        self._build_dbc_tab()
         status = ttk.Label(self.root, textvariable=self.status_var, anchor="w", relief="sunken")
         status.pack(fill="x", side="bottom")
+
+    def _build_dbc_tab(self) -> None:
+        controls = ttk.LabelFrame(self.dbc_tab, text="DBC file and cyclic transmission")
+        controls.pack(fill="x", padx=8, pady=6)
+        self.dbc_load_button = ttk.Button(
+            controls, text="Load DBC...", command=self._choose_dbc
+        )
+        self.dbc_load_button.grid(
+            row=0, column=0, padx=4, pady=5
+        )
+        ttk.Label(
+            controls, textvariable=self.dbc_path_var, foreground="#555555"
+        ).grid(row=0, column=1, columnspan=6, sticky="w", padx=4)
+        ttk.Label(controls, text="Configuration").grid(
+            row=1, column=0, padx=4, pady=4, sticky="w"
+        )
+        self.dbc_profile_combo = ttk.Combobox(
+            controls,
+            textvariable=self.dbc_profile_var,
+            state="readonly",
+            width=24,
+        )
+        self.dbc_profile_combo.grid(row=1, column=1, sticky="w", padx=4, pady=4)
+        ttk.Button(controls, text="Save as...", command=self._save_dbc_profile_as).grid(
+            row=1, column=2, padx=3, pady=4
+        )
+        ttk.Button(controls, text="Save", command=self._save_dbc_profile).grid(
+            row=1, column=3, padx=3, pady=4
+        )
+        ttk.Button(controls, text="Load", command=self._load_selected_dbc_profile).grid(
+            row=1, column=4, padx=3, pady=4
+        )
+        self.dbc_start_button = ttk.Button(
+            controls,
+            text="Toggle selected",
+            command=self._toggle_selected_dbc_messages,
+            state="disabled",
+        )
+        self.dbc_start_button.grid(row=1, column=5, padx=4)
+        self.dbc_stop_button = ttk.Button(
+            controls,
+            text="Stop all",
+            command=self._stop_dbc_transmission,
+            state="disabled",
+        )
+        self.dbc_stop_button.grid(row=1, column=6, padx=4)
+        self.dbc_start_saved_button = ttk.Button(
+            controls,
+            text="Start saved",
+            command=self._start_saved_dbc_messages,
+            state="disabled",
+        )
+        self.dbc_start_saved_button.grid(row=1, column=7, padx=4)
+        ttk.Label(
+            controls,
+            text="Click a message state to toggle it; double-click a cycle-time cell or signal to edit.",
+            foreground="#555555",
+        ).grid(row=2, column=0, columnspan=8, sticky="w", padx=4, pady=(0, 4))
+
+        message_frame = ttk.LabelFrame(
+            self.dbc_tab, text="Messages (Ctrl/Shift-click to select multiple)"
+        )
+        message_frame.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        message_columns = (
+            "id",
+            "name",
+            "dlc",
+            "dbc_cycle",
+            "override",
+            "tx_cycle",
+            "state",
+        )
+        self.dbc_message_table = ttk.Treeview(
+            message_frame,
+            columns=message_columns,
+            show="headings",
+            selectmode="extended",
+            height=8,
+        )
+        for column, title, width in (
+            ("id", "CAN ID", 90),
+            ("name", "Message", 220),
+            ("dlc", "DLC", 55),
+            ("dbc_cycle", "DBC cycle (ms)", 110),
+            ("override", "Override (ms)", 105),
+            ("tx_cycle", "Effective (ms)", 115),
+            ("state", "State", 100),
+        ):
+            self.dbc_message_table.heading(column, text=title)
+            self.dbc_message_table.column(column, width=width, anchor="w")
+        message_scroll = ttk.Scrollbar(
+            message_frame, orient="vertical", command=self.dbc_message_table.yview
+        )
+        self.dbc_message_table.configure(yscrollcommand=message_scroll.set)
+        self.dbc_message_table.pack(side="left", fill="both", expand=True)
+        message_scroll.pack(side="right", fill="y")
+        self.dbc_message_table.bind(
+            "<<TreeviewSelect>>", self._show_dbc_signals
+        )
+        self.dbc_message_table.bind("<ButtonRelease-1>", self._click_dbc_message)
+        self.dbc_message_table.bind("<Double-1>", self._edit_dbc_cycle_time)
+
+        signal_frame = ttk.LabelFrame(
+            self.dbc_tab, text="Signals in selected message (double-click to configure)"
+        )
+        signal_frame.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        signal_columns = (
+            "name",
+            "layout",
+            "scale",
+            "range",
+            "unit",
+            "mode",
+            "settings",
+        )
+        self.dbc_signal_table = ttk.Treeview(
+            signal_frame,
+            columns=signal_columns,
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        for column, title, width in (
+            ("name", "Signal", 180),
+            ("layout", "Start / length", 95),
+            ("scale", "Scale / offset", 115),
+            ("range", "Value bounds", 145),
+            ("unit", "Unit", 85),
+            ("mode", "Update mode", 100),
+            ("settings", "Value / generator range", 220),
+        ):
+            self.dbc_signal_table.heading(column, text=title)
+            self.dbc_signal_table.column(column, width=width, anchor="w")
+        signal_scroll = ttk.Scrollbar(
+            signal_frame, orient="vertical", command=self.dbc_signal_table.yview
+        )
+        self.dbc_signal_table.configure(yscrollcommand=signal_scroll.set)
+        self.dbc_signal_table.pack(side="left", fill="both", expand=True)
+        signal_scroll.pack(side="right", fill="y")
+        self.dbc_signal_table.bind("<Double-1>", self._edit_dbc_signal)
+        ttk.Label(
+            self.dbc_tab, textvariable=self.dbc_status_var, anchor="w"
+        ).pack(fill="x", padx=10, pady=(0, 5))
+
+    def _choose_dbc(self) -> None:
+        if self._dbc_pending:
+            messagebox.showinfo(
+                "Transmission in progress",
+                "Wait for the in-flight DBC frame to finish before loading another file.",
+            )
+            return
+        path = filedialog.askopenfilename(
+            title="Load DBC file",
+            filetypes=(("DBC files", "*.dbc"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            database = load_dbc(path)
+        except (OSError, ValueError, cantools.database.errors.Error) as exc:
+            messagebox.showerror("Could not load DBC", str(exc))
+            return
+
+        self._populate_dbc_database(path, database)
+
+    def _populate_dbc_database(
+        self, path: str, database: cantools.database.Database
+    ) -> None:
+        self._stop_dbc_transmission(silent=True)
+        self.dbc_database = database
+        self.dbc_messages.clear()
+        self.dbc_signal_settings.clear()
+        self.dbc_cycle_overrides.clear()
+        self._dbc_sweep_values.clear()
+        self._dbc_sweep_directions.clear()
+        self._dbc_profile_start_keys.clear()
+        for item in self.dbc_message_table.get_children():
+            self.dbc_message_table.delete(item)
+        self.dbc_path_var.set(path)
+        for index, message in enumerate(
+            sorted(database.messages, key=lambda item: (item.frame_id, item.name))
+        ):
+            key = str(index)
+            self.dbc_messages[key] = message
+            for signal in message.signals:
+                self.dbc_signal_settings[(key, signal.name)] = (
+                    default_signal_settings(signal)
+                )
+            frame_width = 8 if message.is_extended_frame else 3
+            dbc_cycle = (
+                "--"
+                if message.cycle_time is None
+                else f"{message.cycle_time:g}"
+            )
+            self.dbc_message_table.insert(
+                "",
+                "end",
+                iid=key,
+                values=(
+                    f"{message.frame_id:0{frame_width}X}",
+                    message.name,
+                    message.length,
+                    dbc_cycle,
+                    "",
+                    self._dbc_cycle_display(key),
+                    "Stopped",
+                ),
+            )
+        if not database.messages:
+            self.dbc_status_var.set("The DBC contains no messages.")
+        else:
+            self.dbc_status_var.set(
+                f"Loaded {len(database.messages)} message(s) from {Path(path).name}."
+            )
+        self._show_dbc_signals()
+        self._update_dbc_availability()
+
+    @staticmethod
+    def _dbc_message_profile_key(message: Message) -> str:
+        return f"{message.frame_id}:{message.name}"
+
+    def _serialize_dbc_profile(self) -> Dict[str, Any]:
+        if self.dbc_database is None:
+            raise DbcProfilesError("Load a DBC file before saving a configuration.")
+        selected = set(self.dbc_message_table.selection())
+        messages = []
+        cycle_overrides = []
+        signals = []
+        for key, message in self.dbc_messages.items():
+            identity = {
+                "frame_id": message.frame_id,
+                "message": message.name,
+                "selected": key in selected,
+                "running": (
+                    key in self._dbc_next_tx
+                    or key in self._dbc_profile_start_keys
+                ),
+            }
+            messages.append(identity)
+        for key, cycle_time in self.dbc_cycle_overrides.items():
+            message = self.dbc_messages[key]
+            cycle_overrides.append(
+                {**self._dbc_message_profile_identity(message), "cycle_ms": cycle_time}
+            )
+        for (key, signal_name), settings in self.dbc_signal_settings.items():
+            message = self.dbc_messages[key]
+            signals.append(
+                {
+                    **self._dbc_message_profile_identity(message),
+                    "signal": signal_name,
+                    "mode": settings.mode,
+                    "value": settings.value,
+                    "minimum": settings.minimum,
+                    "maximum": settings.maximum,
+                    "step": settings.step,
+                }
+            )
+        return {
+            "dbc_path": str(Path(self.dbc_path_var.get()).resolve()),
+            "messages": messages,
+            "cycle_overrides": cycle_overrides,
+            "signals": signals,
+        }
+
+    @staticmethod
+    def _dbc_message_profile_identity(message: Message) -> Dict[str, Any]:
+        return {"frame_id": message.frame_id, "message": message.name}
+
+    def _refresh_dbc_profile_names(self) -> None:
+        names = tuple(sorted(self.dbc_profiles["profiles"], key=str.casefold))
+        self.dbc_profile_combo.configure(values=names)
+        if self.dbc_profile_var.get() not in names:
+            self.dbc_profile_var.set("")
+
+    def _save_dbc_profile_as(self) -> None:
+        name = simpledialog.askstring(
+            "Save DBC configuration",
+            "Configuration name:",
+            parent=self.root,
+        )
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showerror("Invalid name", "Enter a configuration name.")
+            return
+        if name in self.dbc_profiles["profiles"] and not messagebox.askyesno(
+            "Replace configuration",
+            f"A configuration named '{name}' already exists. Replace it?",
+            parent=self.root,
+        ):
+            return
+        self._save_dbc_profile(name)
+
+    def _save_dbc_profile(self, name: Optional[str] = None) -> None:
+        profile_name = name or self.dbc_profile_var.get().strip()
+        if not profile_name:
+            self._save_dbc_profile_as()
+            return
+        try:
+            profile = self._serialize_dbc_profile()
+            profiles = dict(self.dbc_profiles["profiles"])
+            profiles[profile_name] = profile
+            updated = {"last_profile": profile_name, "profiles": profiles}
+            save_profiles(self.dbc_profiles_path, updated)
+        except (DbcProfilesError, OSError, TypeError, ValueError) as exc:
+            messagebox.showerror("Could not save DBC configuration", str(exc))
+            return
+        self.dbc_profiles = updated
+        self.dbc_profile_var.set(profile_name)
+        self._refresh_dbc_profile_names()
+        self.dbc_profile_var.set(profile_name)
+        self.dbc_status_var.set(f"Saved DBC configuration '{profile_name}'.")
+
+    def _load_selected_dbc_profile(self) -> None:
+        profile_name = self.dbc_profile_var.get().strip()
+        if not profile_name:
+            return
+        self._load_dbc_profile(profile_name)
+
+    def _restore_last_dbc_profile(self) -> None:
+        try:
+            self.dbc_profiles = load_profiles(self.dbc_profiles_path)
+        except DbcProfilesError as exc:
+            self.dbc_status_var.set(str(exc))
+            return
+        self._refresh_dbc_profile_names()
+        last_profile = self.dbc_profiles["last_profile"]
+        if last_profile is not None:
+            self.dbc_profile_var.set(last_profile)
+            self._load_dbc_profile(last_profile, startup=True)
+
+    def _load_dbc_profile(self, profile_name: str, startup: bool = False) -> None:
+        profile = self.dbc_profiles["profiles"].get(profile_name)
+        if profile is None:
+            messagebox.showerror(
+                "Configuration not found",
+                f"DBC configuration '{profile_name}' does not exist.",
+            )
+            return
+        if self._dbc_pending:
+            messagebox.showinfo(
+                "Transmission in progress",
+                "Wait for the in-flight DBC frame to finish before loading a configuration.",
+            )
+            return
+        dbc_path = profile.get("dbc_path")
+        if not isinstance(dbc_path, str) or not dbc_path:
+            self._show_dbc_profile_error(
+                f"Configuration '{profile_name}' does not have a DBC file path.",
+                startup,
+            )
+            return
+        try:
+            database = load_dbc(dbc_path)
+            self._apply_dbc_profile(profile, dbc_path, database)
+        except (OSError, ValueError, TypeError, KeyError, cantools.database.errors.Error) as exc:
+            self._show_dbc_profile_error(
+                f"Could not load DBC configuration '{profile_name}': {exc}",
+                startup,
+            )
+            return
+
+        updated = {
+            "last_profile": profile_name,
+            "profiles": self.dbc_profiles["profiles"],
+        }
+        try:
+            save_profiles(self.dbc_profiles_path, updated)
+        except DbcProfilesError as exc:
+            messagebox.showerror("Could not save DBC configuration state", str(exc))
+        else:
+            self.dbc_profiles = updated
+        self.dbc_profile_var.set(profile_name)
+        self.dbc_status_var.set(
+            f"Loaded '{profile_name}'. Open CAN in Normal mode, then use Start saved "
+            "to resume previously running messages."
+        )
+
+    def _show_dbc_profile_error(self, message: str, startup: bool) -> None:
+        self.dbc_status_var.set(message)
+        if not startup:
+            messagebox.showerror("Could not load DBC configuration", message)
+
+    def _apply_dbc_profile(
+        self,
+        profile: Dict[str, Any],
+        dbc_path: str,
+        database: cantools.database.Database,
+    ) -> None:
+        if not isinstance(profile.get("messages"), list):
+            raise ValueError("'messages' must be a list.")
+        if not isinstance(profile.get("cycle_overrides"), list):
+            raise ValueError("'cycle_overrides' must be a list.")
+        if not isinstance(profile.get("signals"), list):
+            raise ValueError("'signals' must be a list.")
+
+        self._populate_dbc_database(dbc_path, database)
+        message_keys = {
+            self._dbc_message_profile_key(message): key
+            for key, message in self.dbc_messages.items()
+        }
+        selected_keys = []
+        saved_running_keys = set()
+        for entry in profile["messages"]:
+            profile_key = self._validate_dbc_profile_identity(entry)
+            if not isinstance(entry.get("selected", True), bool):
+                raise ValueError(f"{profile_key}: selected must be true or false.")
+            if not isinstance(entry.get("running", False), bool):
+                raise ValueError(f"{profile_key}: running must be true or false.")
+            key = message_keys.get(profile_key)
+            if key is not None and entry.get("selected", True) is True:
+                selected_keys.append(key)
+            if key is not None and entry.get("running", False) is True:
+                saved_running_keys.add(key)
+
+        for entry in profile["cycle_overrides"]:
+            profile_key = self._validate_dbc_profile_identity(entry)
+            key = message_keys.get(profile_key)
+            if key is None:
+                continue
+            cycle_ms = float(entry["cycle_ms"])
+            if not 1 <= cycle_ms <= 3_600_000:
+                raise ValueError(f"{profile_key}: invalid cycle override.")
+            self.dbc_cycle_overrides[key] = cycle_ms
+            self._refresh_dbc_message(key)
+
+        for entry in profile["signals"]:
+            profile_key = self._validate_dbc_profile_identity(entry)
+            key = message_keys.get(profile_key)
+            if key is None:
+                continue
+            signal_name = entry.get("signal")
+            setting_key = (key, signal_name)
+            if setting_key not in self.dbc_signal_settings:
+                continue
+            settings = SignalTxSettings(
+                mode=entry["mode"],
+                value=float(entry["value"]),
+                minimum=float(entry["minimum"]),
+                maximum=float(entry["maximum"]),
+                step=float(entry["step"]),
+            )
+            if settings.mode not in ("raw", "sweep", "random"):
+                raise ValueError(f"{profile_key}.{signal_name}: invalid mode.")
+            signal = self.dbc_messages[key].get_signal_by_name(signal_name)
+            minimum, maximum = signal_value_bounds(signal)
+            if not all(
+                math.isfinite(value)
+                for value in (
+                    settings.value,
+                    settings.minimum,
+                    settings.maximum,
+                    settings.step,
+                )
+            ):
+                raise ValueError(f"{profile_key}.{signal_name}: values must be finite.")
+            if settings.mode == "raw" and not minimum <= settings.value <= maximum:
+                raise ValueError(f"{profile_key}.{signal_name}: static value out of range.")
+            if settings.mode in ("sweep", "random") and not (
+                minimum <= settings.minimum <= settings.maximum <= maximum
+            ):
+                raise ValueError(f"{profile_key}.{signal_name}: bounds are out of range.")
+            if settings.mode == "sweep" and not (
+                0 < settings.step <= settings.maximum - settings.minimum
+            ):
+                raise ValueError(f"{profile_key}.{signal_name}: invalid sweep step.")
+            self.dbc_signal_settings[setting_key] = settings
+
+        if selected_keys:
+            self.dbc_message_table.selection_set(selected_keys)
+        self._dbc_profile_start_keys = saved_running_keys
+        for key in self.dbc_messages:
+            self._refresh_dbc_message(key)
+        self._show_dbc_signals()
+        self._update_dbc_availability()
+
+    @staticmethod
+    def _validate_dbc_profile_identity(entry: Any) -> str:
+        if not isinstance(entry, dict):
+            raise ValueError("A message configuration must be an object.")
+        frame_id = entry.get("frame_id")
+        message_name = entry.get("message")
+        if (
+            isinstance(frame_id, bool)
+            or not isinstance(frame_id, int)
+            or not isinstance(message_name, str)
+        ):
+            raise ValueError("A message configuration needs a CAN ID and message name.")
+        return f"{frame_id}:{message_name}"
+
+    def _dbc_cycle_display(self, key: str) -> str:
+        override = self.dbc_cycle_overrides.get(key)
+        if override is not None:
+            return f"{override:g} (override)"
+        message = self.dbc_messages[key]
+        if message.cycle_time is not None:
+            return f"{message.cycle_time:g} (DBC)"
+        return "100 (fallback)"
+
+    def _refresh_dbc_message(self, key: str) -> None:
+        if not self.dbc_message_table.exists(key):
+            return
+        message = self.dbc_messages[key]
+        dbc_cycle = (
+            "--"
+            if message.cycle_time is None
+            else f"{message.cycle_time:g}"
+        )
+        override = self.dbc_cycle_overrides.get(key)
+        self.dbc_message_table.item(
+            key,
+            values=(
+                self.dbc_message_table.item(key, "values")[0],
+                message.name,
+                message.length,
+                dbc_cycle,
+                "" if override is None else f"{override:g}",
+                self._dbc_cycle_display(key),
+                (
+                    "Running"
+                    if key in self._dbc_next_tx
+                    else "Ready"
+                    if key in self._dbc_profile_start_keys
+                    else "Stopping..."
+                    if key in self._dbc_pending
+                    else "Stopped"
+                ),
+            ),
+        )
+
+    def _edit_dbc_cycle_time(self, event) -> None:
+        if self.dbc_message_table.identify_column(event.x) not in ("#4", "#5", "#6"):
+            return
+        key = self.dbc_message_table.identify_row(event.y)
+        if not key:
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Override cycle time")
+        window.transient(self.root)
+        fields = ttk.Frame(window, padding=10)
+        fields.pack(fill="both", expand=True)
+        ttk.Label(fields, text=f"Cycle time for {self.dbc_messages[key].name} (ms)").grid(
+            row=0, column=0, sticky="w"
+        )
+        value_var = tk.StringVar(
+            value=(
+                ""
+                if key not in self.dbc_cycle_overrides
+                else f"{self.dbc_cycle_overrides[key]:g}"
+            )
+        )
+        entry = ttk.Entry(fields, textvariable=value_var, width=18)
+        entry.grid(row=1, column=0, sticky="ew", pady=5)
+        ttk.Label(
+            fields,
+            text="Leave blank to use the DBC cycle time (100 ms if none is defined).",
+            foreground="#555555",
+        ).grid(row=2, column=0, sticky="w")
+
+        def save() -> None:
+            text = value_var.get().strip()
+            if text:
+                try:
+                    cycle_ms = float(text)
+                except ValueError:
+                    messagebox.showerror(
+                        "Invalid cycle time", "Enter a positive number of milliseconds.", parent=window
+                    )
+                    return
+                if not 1 <= cycle_ms <= 3_600_000:
+                    messagebox.showerror(
+                        "Invalid cycle time",
+                        "Cycle time must be at least 1 and no more than 3,600,000 ms.",
+                        parent=window,
+                    )
+                    return
+                self.dbc_cycle_overrides[key] = cycle_ms
+            else:
+                self.dbc_cycle_overrides.pop(key, None)
+            if key in self._dbc_periods:
+                self._dbc_periods[key] = self._dbc_effective_cycle(key) / 1000
+                self._dbc_next_tx[key] = time.monotonic() + self._dbc_periods[key]
+            self._refresh_dbc_message(key)
+            window.destroy()
+
+        buttons = ttk.Frame(fields)
+        buttons.grid(row=3, column=0, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Cancel", command=window.destroy).pack(
+            side="right", padx=(4, 0)
+        )
+        ttk.Button(buttons, text="Save", command=save).pack(side="right")
+        entry.focus_set()
+        window.bind("<Return>", lambda _event: save())
+        window.wait_visibility()
+        window.grab_set()
+
+    def _dbc_effective_cycle(self, key: str) -> float:
+        override = self.dbc_cycle_overrides.get(key)
+        if override is not None:
+            return override
+        cycle_time = self.dbc_messages[key].cycle_time
+        return 100.0 if cycle_time is None else float(cycle_time)
+
+    def _show_dbc_signals(self, _event=None) -> None:
+        for item in self.dbc_signal_table.get_children():
+            self.dbc_signal_table.delete(item)
+        selection = self.dbc_message_table.selection()
+        if not selection:
+            return
+        key = selection[0]
+        message = self.dbc_messages.get(key)
+        if message is None:
+            return
+        for signal in message.signals:
+            settings = self.dbc_signal_settings[(key, signal.name)]
+            minimum, maximum = signal_value_bounds(signal)
+            self.dbc_signal_table.insert(
+                "",
+                "end",
+                iid=signal.name,
+                values=(
+                    signal.name,
+                    f"{signal.start} / {signal.length}",
+                    f"{signal.scale:g} / {signal.offset:g}",
+                    f"{minimum:g} .. {maximum:g}",
+                    signal.unit or "",
+                    settings.mode,
+                    self._dbc_signal_settings_display(settings),
+                ),
+            )
+
+    @staticmethod
+    def _dbc_signal_settings_display(settings: SignalTxSettings) -> str:
+        if settings.mode == "raw":
+            return f"{settings.value:g}"
+        return f"{settings.minimum:g} .. {settings.maximum:g}, step {settings.step:g}"
+
+    def _edit_dbc_signal(self, event) -> None:
+        key_selection = self.dbc_message_table.selection()
+        signal_name = self.dbc_signal_table.identify_row(event.y)
+        if not key_selection or not signal_name:
+            return
+        message_key = key_selection[0]
+        message = self.dbc_messages[message_key]
+        signal = message.get_signal_by_name(signal_name)
+        settings = self.dbc_signal_settings[(message_key, signal_name)]
+
+        window = tk.Toplevel(self.root)
+        window.title(f"Configure {message.name}.{signal.name}")
+        window.transient(self.root)
+        fields = ttk.Frame(window, padding=10)
+        fields.pack(fill="both", expand=True)
+        ttk.Label(
+            fields,
+            text=f"{signal.name} ({signal.unit or 'unitless'})",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        mode_var = tk.StringVar(value=settings.mode)
+        value_var = tk.StringVar(value=f"{settings.value:g}")
+        minimum_var = tk.StringVar(value=f"{settings.minimum:g}")
+        maximum_var = tk.StringVar(value=f"{settings.maximum:g}")
+        step_var = tk.StringVar(value=f"{settings.step:g}")
+        for row, label, variable in (
+            (1, "Update mode", mode_var),
+            (2, "Static value", value_var),
+            (3, "Minimum", minimum_var),
+            (4, "Maximum", maximum_var),
+            (5, "Sweep step", step_var),
+        ):
+            ttk.Label(fields, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            if row == 1:
+                ttk.Combobox(
+                    fields,
+                    textvariable=variable,
+                    values=("raw", "sweep", "random"),
+                    state="readonly",
+                    width=18,
+                ).grid(row=row, column=1, sticky="ew", pady=2)
+            else:
+                ttk.Entry(fields, textvariable=variable, width=20).grid(
+                    row=row, column=1, sticky="ew", pady=2
+                )
+        ttk.Label(
+            fields,
+            text="Static values and generator ranges use physical (scaled) units.",
+            foreground="#555555",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        def save() -> None:
+            try:
+                updated = SignalTxSettings(
+                    mode=mode_var.get(),
+                    value=float(value_var.get()),
+                    minimum=float(minimum_var.get()),
+                    maximum=float(maximum_var.get()),
+                    step=float(step_var.get()),
+                )
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid signal value",
+                    "Signal values, bounds, and step must be numeric.",
+                    parent=window,
+                )
+                return
+            if updated.mode == "sweep" and (
+                updated.maximum <= updated.minimum
+                or updated.step <= 0
+                or updated.step > updated.maximum - updated.minimum
+            ):
+                messagebox.showerror(
+                    "Invalid sweep range",
+                    "A sweep requires maximum > minimum and a positive step no "
+                    "larger than the range.",
+                    parent=window,
+                )
+                return
+            if updated.mode == "random" and updated.minimum > updated.maximum:
+                messagebox.showerror(
+                    "Invalid random range",
+                    "Random minimum must not exceed maximum.",
+                    parent=window,
+                )
+                return
+            minimum, maximum = signal_value_bounds(signal)
+            if updated.mode in ("sweep", "random") and (
+                updated.minimum < minimum or updated.maximum > maximum
+            ):
+                messagebox.showerror(
+                    "Invalid signal range",
+                    f"Generator bounds must be between {minimum:g} and {maximum:g}.",
+                    parent=window,
+                )
+                return
+            if updated.mode == "raw" and not minimum <= updated.value <= maximum:
+                messagebox.showerror(
+                    "Invalid static value",
+                    f"Value must be between {minimum:g} and {maximum:g}.",
+                    parent=window,
+                )
+                return
+            self.dbc_signal_settings[(message_key, signal_name)] = updated
+            self._show_dbc_signals()
+            window.destroy()
+
+        buttons = ttk.Frame(fields)
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Cancel", command=window.destroy).pack(
+            side="right", padx=(4, 0)
+        )
+        ttk.Button(buttons, text="Save", command=save).pack(side="right")
+        window.wait_visibility()
+        window.grab_set()
+
+    def _update_dbc_availability(self) -> None:
+        can_transmit = (
+            self.dbc_database is not None
+            and bool(self.dbc_messages)
+            and self.connected
+            and self.can_open
+            and self.mode_var.get() == "Normal"
+        )
+        self.dbc_start_button.configure(state="normal" if can_transmit else "disabled")
+        self.dbc_stop_button.configure(
+            state="normal" if self.dbc_running else "disabled"
+        )
+        if self.dbc_start_saved_button is not None:
+            self.dbc_start_saved_button.configure(
+                state=(
+                    "normal"
+                    if can_transmit and self._dbc_profile_start_keys
+                    else "disabled"
+                )
+            )
+        if self.dbc_load_button is not None:
+            self.dbc_load_button.configure(
+                state="disabled" if self._dbc_pending else "normal"
+            )
+
+    def _click_dbc_message(self, event):
+        if self.dbc_message_table.identify_column(event.x) != "#7":
+            return
+        key = self.dbc_message_table.identify_row(event.y)
+        if not key:
+            return
+        self.dbc_message_table.selection_set(key)
+        self.dbc_message_table.focus(key)
+        self._show_dbc_signals()
+        self._toggle_dbc_message(key)
+        return "break"
+
+    def _toggle_selected_dbc_messages(self) -> None:
+        selected = self.dbc_message_table.selection()
+        if not selected:
+            messagebox.showinfo(
+                "Select messages", "Select one or more DBC messages to toggle."
+            )
+            return
+        to_start = [key for key in selected if key not in self._dbc_next_tx]
+        if to_start and not self._validate_dbc_start(to_start):
+            return
+        for key in selected:
+            if key in self._dbc_next_tx:
+                self._stop_dbc_message(key)
+            else:
+                self._start_dbc_message(key)
+        self._update_dbc_availability()
+        self._schedule_dbc_transmitter()
+
+    def _toggle_dbc_message(self, key: str) -> None:
+        if key in self._dbc_next_tx:
+            self._stop_dbc_message(key)
+        else:
+            if not self._validate_dbc_start([key]):
+                return
+            self._start_dbc_message(key)
+        self._update_dbc_availability()
+        self._schedule_dbc_transmitter()
+
+    def _start_saved_dbc_messages(self) -> None:
+        keys = sorted(self._dbc_profile_start_keys)
+        if not keys:
+            return
+        if not self._validate_dbc_start(keys):
+            return
+        for key in keys:
+            self._start_dbc_message(key)
+        self._dbc_profile_start_keys.clear()
+        self._update_dbc_availability()
+        self._schedule_dbc_transmitter()
+
+    def _validate_dbc_start(self, keys: Sequence[str]) -> bool:
+        if not self.can_open or self.mode_var.get() != "Normal" or self.worker is None:
+            messagebox.showerror(
+                "CAN is not ready",
+                "Open CAN in Normal mode before starting DBC transmission.",
+            )
+            return False
+        unsupported = [
+            self.dbc_messages[key]
+            for key in keys
+            if self.dbc_messages[key].length > 8
+        ]
+        if unsupported:
+            names = ", ".join(message.name for message in unsupported)
+            messagebox.showerror(
+                "Unsupported CAN frame size",
+                f"The current SLCAN interface supports up to 8 data bytes. "
+                f"Remove these CAN FD or oversized messages from the selection: {names}",
+            )
+            return False
+        invalid_cycles = [
+            self.dbc_messages[key].name
+            for key in keys
+            if not 1 <= self._dbc_effective_cycle(key) <= 3_600_000
+        ]
+        if invalid_cycles:
+            messagebox.showerror(
+                "Invalid cycle time",
+                "Set a cycle time from 1 to 3,600,000 ms for: "
+                + ", ".join(invalid_cycles),
+            )
+            return False
+        return True
+
+    def _start_dbc_message(self, key: str) -> None:
+        self._dbc_profile_start_keys.discard(key)
+        self._dbc_next_tx[key] = time.monotonic()
+        self._dbc_periods[key] = self._dbc_effective_cycle(key) / 1000
+        self._dbc_sweep_values[key] = {}
+        self._dbc_sweep_directions[key] = {}
+        self.dbc_running = True
+        self.dbc_status_var.set(
+            f"Running {self.dbc_messages[key].name}; "
+            f"{len(self._dbc_next_tx)} message(s) active."
+        )
+        self._refresh_dbc_message(key)
+
+    def _stop_dbc_message(self, key: str) -> None:
+        self._dbc_profile_start_keys.discard(key)
+        self._dbc_next_tx.pop(key, None)
+        self._dbc_periods.pop(key, None)
+        self._dbc_sweep_values.pop(key, None)
+        self._dbc_sweep_directions.pop(key, None)
+        self.dbc_running = bool(self._dbc_next_tx)
+        self.dbc_status_var.set(
+            f"Stopped {self.dbc_messages[key].name}; "
+            f"{len(self._dbc_next_tx)} message(s) active."
+        )
+        self._refresh_dbc_message(key)
+
+    def _schedule_dbc_transmitter(self) -> None:
+        if not self.dbc_running or self._dbc_after is not None:
+            return
+        self._dbc_after = self.root.after(1, self._run_dbc_transmitter)
+
+    def _stop_dbc_transmission(self, silent: bool = False) -> None:
+        was_running = self.dbc_running or bool(self._dbc_profile_start_keys)
+        self.dbc_running = False
+        self.dbc_message_table.configure(selectmode="extended")
+        if self._dbc_after is not None:
+            self.root.after_cancel(self._dbc_after)
+            self._dbc_after = None
+        self._dbc_next_tx.clear()
+        self._dbc_periods.clear()
+        self._dbc_sweep_values.clear()
+        self._dbc_sweep_directions.clear()
+        self._dbc_profile_start_keys.clear()
+        self._update_dbc_availability()
+        for key in self.dbc_messages:
+            self._refresh_dbc_message(key)
+        if was_running and not silent:
+            self.dbc_status_var.set(
+                "Stopped all DBC messages. An in-flight frame may still complete."
+            )
+
+    def _run_dbc_transmitter(self) -> None:
+        self._dbc_after = None
+        if (
+            not self.dbc_running
+            or not self.can_open
+            or self.mode_var.get() != "Normal"
+            or not self.connected
+            or self.worker is None
+        ):
+            self._stop_dbc_transmission(silent=True)
+            self.dbc_status_var.set(
+                "DBC transmission stopped because CAN is no longer open in Normal mode."
+            )
+            return
+
+        now = time.monotonic()
+        due = sorted(
+            (deadline, key)
+            for key, deadline in self._dbc_next_tx.items()
+            if deadline <= now
+        )
+        for deadline, key in due:
+            period = self._dbc_periods[key]
+            missed_periods = max(1, int((now - deadline) / period) + 1)
+            self._dbc_next_tx[key] = deadline + missed_periods * period
+            if key not in self._dbc_pending:
+                self._queue_dbc_message(key)
+
+        if self._dbc_next_tx:
+            next_deadline = min(self._dbc_next_tx.values())
+            delay_ms = max(1, int((next_deadline - time.monotonic()) * 1000))
+            self._dbc_after = self.root.after(delay_ms, self._run_dbc_transmitter)
+
+    def _queue_dbc_message(self, key: str) -> None:
+        if self.worker is None:
+            return
+        message = self.dbc_messages[key]
+        settings = {
+            signal.name: self.dbc_signal_settings[(key, signal.name)]
+            for signal in message.signals
+        }
+        try:
+            payload = encode_message(
+                message,
+                settings,
+                self._dbc_sweep_values[key],
+                sweep_directions=self._dbc_sweep_directions[key],
+            )
+            command = encode_frame(
+                CanFrame(
+                    message.frame_id,
+                    message.is_extended_frame,
+                    False,
+                    message.length,
+                    payload,
+                )
+            )
+        except (ValueError, cantools.database.errors.Error) as exc:
+            self._stop_dbc_message(key)
+            messagebox.showerror(
+                "DBC transmission failed",
+                f"{message.name} was stopped: {exc}",
+            )
+            return
+
+        self._dbc_pending.add(key)
+        self.worker.send(command, f"dbc_tx:{key}")
+        self._refresh_dbc_message(key)
+        self._update_dbc_availability()
 
     def _build_simulator_tab(self) -> None:
         controls = ttk.LabelFrame(self.simulator_tab, text="OBD-II ECU simulator")
@@ -1407,10 +2426,12 @@ class SlcanApp:
     def disconnect(self) -> None:
         if self.worker is None:
             return
+        self._stop_dbc_transmission(silent=True)
         self.disconnect_button.configure(state="disabled")
         self.open_button.configure(state="disabled")
         self.close_can_button.configure(state="disabled")
         self.send_button.configure(state="disabled")
+        self._update_dbc_availability()
         self.status_var.set("Disconnecting...")
         self._send_command("C", "disconnect_close")
 
@@ -1427,6 +2448,7 @@ class SlcanApp:
 
     def close_can(self) -> None:
         if self.can_open:
+            self._stop_dbc_transmission(silent=True)
             self.close_can_button.configure(state="disabled")
             self._send_command("C", "close_can")
 
@@ -1535,7 +2557,9 @@ class SlcanApp:
                 button.configure(state="normal")
             self.status_var.set("Serial connected; CAN is closed.")
             self._save_connection_preferences_after_connect()
+            self._update_dbc_availability()
         elif event_type == "disconnected":
+            self._stop_dbc_transmission(silent=True)
             self.connected = False
             self._pending_connection_preferences = None
             self.can_open = False
@@ -1717,6 +2741,16 @@ class SlcanApp:
         ok = event["ok"]
         response = event["response"]
         if not ok:
+            if tag.startswith("dbc_tx:"):
+                key = tag.removeprefix("dbc_tx:")
+                self._dbc_pending.discard(key)
+                self._stop_dbc_message(key)
+                self.dbc_status_var.set(
+                    f"DBC transmission failed for {self.dbc_messages[key].name}: {response}"
+                )
+                self._update_dbc_availability()
+                messagebox.showerror("DBC transmission failed", response)
+                return
             if tag == "disconnect_close":
                 if self.worker is not None:
                     self.worker.disconnect()
@@ -1747,21 +2781,33 @@ class SlcanApp:
             )
             self.status_var.set(f"CAN open ({self.mode_var.get().lower()} mode). {response}".strip())
             self._set_simulator_availability()
+            self._update_dbc_availability()
         elif tag == "close_can":
             self.can_open = False
+            self._stop_dbc_transmission(silent=True)
             self._stop_bus_load_measurement()
             self.open_button.configure(state="normal")
             self.close_can_button.configure(state="disabled")
             self.send_button.configure(state="disabled")
             self.status_var.set("CAN closed.")
             self._set_simulator_availability()
+            self._update_dbc_availability()
         elif tag == "disconnect_close":
             self.can_open = False
+            self._stop_dbc_transmission(silent=True)
             if self.worker is not None:
                 self.worker.disconnect()
         elif tag == "transmit":
             self.status_var.set(f"Transmit accepted. {response}".strip())
             self._add_frame(event["command"], "TX")
+        elif tag.startswith("dbc_tx:"):
+            key = tag.removeprefix("dbc_tx:")
+            self._dbc_pending.discard(key)
+            self._add_frame(event["command"], "TX")
+            if self.dbc_running:
+                self._schedule_dbc_transmitter()
+            self._update_dbc_availability()
+            self._refresh_dbc_message(key)
         elif tag == "ecu_response":
             self._add_frame(event["command"], "TX")
             if self._simulator_isotp_sender is not None:
@@ -1871,6 +2917,7 @@ class SlcanApp:
 
     def _on_close(self) -> None:
         self._closing = True
+        self._stop_dbc_transmission(silent=True)
         if self.worker is None:
             self.root.destroy()
             return

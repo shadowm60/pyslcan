@@ -11,9 +11,42 @@ class SerialWorkerTests(unittest.TestCase):
         worker = SerialWorker("mock-port", 115200, events, response_timeout=0.1)
         serial_port = Mock()
         serial_port.read.side_effect = [incoming, b""]
+        serial_port.in_waiting = len(incoming)
         serial_port.write.return_value = len(incoming)
         worker._serial = serial_port
         return worker, events
+
+    def test_read_line_reads_only_bytes_already_available(self):
+        worker, _events = self.make_worker(b"\r")
+
+        self.assertEqual(worker._read_line(), "")
+
+        worker._serial.read.assert_called_once_with(1)
+
+    def test_idle_read_does_not_wait_when_no_bytes_are_available(self):
+        worker, _events = self.make_worker(b"")
+        worker._serial.in_waiting = 0
+
+        worker._read_available()
+
+        worker._serial.read.assert_not_called()
+
+    def test_idle_read_consumes_available_data_without_waiting(self):
+        raw_frame = b"t1231AA\r"
+        worker, events = self.make_worker(raw_frame)
+        worker._serial.in_waiting = len(raw_frame)
+
+        def read_available(size):
+            worker._serial.in_waiting = 0
+            return raw_frame
+
+        worker._serial.read.side_effect = read_available
+        worker._read_available()
+
+        self.assertEqual(
+            events.get_nowait(), {"type": "frame", "line": "t1231AA"}
+        )
+        worker._serial.read.assert_called_once_with(len(raw_frame))
 
     def test_bel_without_carriage_return_is_command_failure(self):
         worker, events = self.make_worker(b"\x07")

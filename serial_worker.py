@@ -167,7 +167,7 @@ class SerialWorker(threading.Thread):
 
     def _read_available(self) -> None:
         while True:
-            line = self._read_line()
+            line = self._read_line(wait_for_data=False)
             if line is None:
                 return
             if not line:
@@ -184,10 +184,13 @@ class SerialWorker(threading.Thread):
                 self._debug(f"RX unsolicited line: {line!r}")
                 self.events.put({"type": "text", "line": line})
 
-    def _read_line(self) -> Optional[str]:
+    def _read_line(self, wait_for_data: bool = True) -> Optional[str]:
         assert self._serial is not None
         if 0x0D not in self._buffer and 0x07 not in self._buffer:
-            data = self._serial.read(256)
+            available = self._serial.in_waiting
+            if not wait_for_data and not available:
+                return None
+            data = self._serial.read(max(1, available))
             if data:
                 self._buffer.extend(data)
                 self._debug(f"RX raw {data!r} (hex={data.hex(' ').upper()})")

@@ -20,6 +20,7 @@ env/
 # Local logs and exported captures
 *.log
 *.csv
+*.asc
 
 # Operating system files
 .DS_Store

@@ -92,8 +92,41 @@ frames. Remote frames carry a DLC but no data. In listen-only mode the app
 disables transmission.
 
 The device protocol is implemented in `slcan_protocol.py`; serial I/O runs on
-a background worker so the UI remains responsive. `CanFrame` is the frame
-representation intended to be reused by future DBC or OBD-II decoders.
+a background worker so the UI remains responsive.
+
+## DBC cyclic transmitter
+
+The **DBC transmitter** tab loads a `.dbc` file and lists its messages. Select
+one or more messages and use **Toggle selected**, or click a row's **State**
+cell, to start or stop individual messages while CAN is open in Normal mode.
+Several messages can run together; **Stop all** stops them at once. Each
+message uses its DBC cycle time by default; double-click a **DBC cycle (ms)**,
+**Override (ms)**, or **Effective (ms)** cell to set a custom period. If the
+DBC has no cycle time, the transmitter uses a visible 100 ms fallback that can
+also be overridden.
+
+Select a message to view its signals, then double-click a signal to configure
+it as a fixed physical value (`raw`), a bouncing sweep, or a random value
+within a physical range. Signal values are encoded using the DBC scaling and
+layout. Sweeps bounce between their minimum and maximum. Default signal bounds
+come from the DBC; if bounds are missing, the UI falls back to the full range
+representable by that signal's bit length and scale. The default sweep step is
+the signal scale (its physical resolution). For practical ranges such as an
+engine's RPM limit, set the signal's minimum and maximum in the DBC; DBC does
+not define a separate signal step. Configured values and ranges are checked
+against the DBC bounds. The transmitter supports up to 8 data bytes per
+message, matching the current SLCAN protocol. Frames are serialized through
+the serial worker; periods shorter than the interface can send are not
+guaranteed.
+
+Use **Save as...** to create multiple named DBC configurations; **Save**
+updates the selected configuration. A profile stores its DBC path, selected
+messages, which messages were running, cycle overrides, and signal
+values/generator settings. The last loaded or saved profile is restored on the
+next launch, but transmission does not start automatically. After opening CAN
+in Normal mode, use **Start saved** to resume messages that were running when
+the profile was saved. Profiles are stored in the per-user `dbc_profiles.json`
+settings file.
 
 ## Estimated CAN bus load
 
